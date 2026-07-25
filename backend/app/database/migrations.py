@@ -61,6 +61,11 @@ async def _ensure_recent_columns() -> None:
         "ALTER TABLE documents ADD COLUMN IF NOT EXISTS extractor TEXT",
         # Book vs. research-paper reading mode (chosen at upload).
         "ALTER TABLE documents ADD COLUMN IF NOT EXISTS doc_kind TEXT NOT NULL DEFAULT 'paper'",
+        # Paper-only mode: was the embedding pass run, or skipped because the
+        # document fits whole in the chat model's context? Defaults to
+        # 'embedded' so existing rows keep their behaviour on upgrade.
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_mode TEXT NOT NULL DEFAULT 'embedded'",
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_skip_reason TEXT",
         # Nested sub-threads for tangents (paper-free focus mode inside threads).
         # Main chat turns keep parent_turn_id = NULL. Sub-thread turns point to their parent.
         "ALTER TABLE conversation_turns ADD COLUMN IF NOT EXISTS parent_turn_id UUID REFERENCES conversation_turns(id) ON DELETE CASCADE",

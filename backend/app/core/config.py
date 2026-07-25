@@ -144,6 +144,25 @@ class Settings(BaseSettings):
     def effective_classifier_model(self) -> str:
         return self.classifier_model or self.chat_model
 
+    # ── Paper-only mode ─────────────────────────────────────────────────────
+    # Skip the embedding pass for documents small enough to fit whole in the
+    # chat model's context, serving GLOBAL from full-text search + document
+    # stuffing instead of pgvector. See
+    # docs/plans/paper-only-embedding-skip.md.
+    #
+    # Default False so upgrading changes nothing. The decision is made once, at
+    # ingestion, and stored in documents.embedding_mode — it is never
+    # re-derived, so flipping this (or the threshold) never reclassifies a
+    # library that is already ingested.
+    paper_only_mode: bool = False
+    # Skip only when SUM(chunks.token_count) is at or below this.
+    # NOT set near the model's full context: the document body has to share the
+    # window with the system prompt, conversation history, and the answer.
+    # ⚠ token_count is len(plain_text)/4 — a character heuristic that
+    # undercounts math and tables badly, which is most of what this app ingests.
+    # 50k against a 262k window absorbs that error; 250k would not.
+    paper_only_max_tokens: int = 50_000
+
     # LOCAL context window size (number of chunks on each side of the current one)
     local_context_window: int = 3   # Increased from 2 for better "see surrounding" experience
 

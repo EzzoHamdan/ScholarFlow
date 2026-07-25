@@ -29,7 +29,18 @@ CREATE TABLE IF NOT EXISTS documents (
 
     -- Whether this document is a "book" (chapter-by-chapter reading navigation)
     -- or a "paper" (linear reading). Chosen by the user at upload time.
-    doc_kind TEXT NOT NULL DEFAULT 'paper'
+    doc_kind TEXT NOT NULL DEFAULT 'paper',
+
+    -- Paper-only mode: whether this document was embedded at ingestion, or the
+    -- embedding pass was skipped because the whole document fits in the chat
+    -- model's context (see docs/plans/paper-only-embedding-skip.md).
+    --
+    -- 'embedded' is the default so that upgrading changes nothing: every
+    -- pre-existing row keeps its current behaviour. The value is DECIDED ONCE
+    -- at ingestion and never re-derived, so changing PAPER_ONLY_MAX_TOKENS
+    -- cannot retroactively reclassify a library.
+    embedding_mode TEXT NOT NULL DEFAULT 'embedded',
+    embedding_skip_reason TEXT
 );
 
 COMMENT ON COLUMN documents.reading_order IS 'Array of original chunk sequence_ids in LLM-corrected logical reading order. Used to fix two-column and complex layout extraction issues.';

@@ -17,7 +17,10 @@ class JobStatus(str, Enum):
 TRANSITIONS: dict[JobStatus, list[JobStatus]] = {
     JobStatus.QUEUED: [JobStatus.EXTRACTING, JobStatus.FAILED],
     JobStatus.EXTRACTING: [JobStatus.CHUNKING, JobStatus.FAILED],
-    JobStatus.CHUNKING: [JobStatus.EMBEDDING, JobStatus.FAILED],
+    # CHUNKING -> SUMMARIZING is the paper-only skip path: when the embedding
+    # pass is skipped, the pipeline dispatches generate_section_summaries
+    # directly, so the job never passes through EMBEDDING.
+    JobStatus.CHUNKING: [JobStatus.EMBEDDING, JobStatus.SUMMARIZING, JobStatus.FAILED],
     JobStatus.EMBEDDING: [JobStatus.SUMMARIZING, JobStatus.COMPLETE, JobStatus.FAILED],
     JobStatus.SUMMARIZING: [JobStatus.COMPLETE, JobStatus.FAILED],
     JobStatus.COMPLETE: [],
