@@ -1,4 +1,19 @@
-# Database Migrations & Schema Changes (Personal Use)
+# Database migrations & schema changes
+
+> **What this is:** how schema changes reach a running database, and what to do when they don't.
+>
+> **Owns:** the migration procedure.
+> **Does not own:** what the tables contain ([database-schema.md](database-schema.md)).
+>
+> **Status:** current · **Last verified:** 2026-07-25 against
+> [`database/migrations.py`](../../backend/app/database/migrations.py)
+> **Verify with:** restart the API and read the migration log lines
+>
+> ⚠ **Migrations are best-effort by design.** Each statement runs in its own transaction and a
+> failure is logged as a warning, not raised — then `_ensure_recent_columns()` patches up columns
+> that didn't apply. This is a recovery mechanism, not a migration system: it cannot detect a
+> partially-applied change it doesn't already know about. Replacing it with Alembic is tracked in
+> [roadmap.md](../roadmap.md).
 
 This project uses an "apply the SQL" approach rather than Alembic because it is a single-tenant local desktop tool.
 

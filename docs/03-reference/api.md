@@ -1,7 +1,16 @@
-# API Reference
+# API reference
+
+> **What this is:** every HTTP endpoint, its payload, and its errors. Look-up only — no narrative.
+>
+> **Owns:** endpoint paths, request/response shapes, status codes.
+> **Does not own:** why a route behaves as it does ([chat-and-ask.md](../02-architecture/chat-and-ask.md)).
+>
+> **Status:** current · **Last verified:** 2026-07-25 against
+> [`api/v1/router.py`](../../backend/app/api/v1/router.py)
+> **Verify with:** `http://localhost:8000/docs` (live OpenAPI, always authoritative)
 
 All endpoints live under the prefix **`/api/v1`** and are registered in
-[api/v1/router.py](../backend/app/api/v1/router.py).
+[api/v1/router.py](../../backend/app/api/v1/router.py).
 
 ```
 GET    /health
@@ -38,7 +47,7 @@ GET /static/images/research/<conv_id>/<file> — research-agent-saved images
 
 ### `GET /health`
 
-Source: [endpoints/health.py](../backend/app/api/v1/endpoints/health.py).
+Source: [endpoints/health.py](../../backend/app/api/v1/endpoints/health.py).
 
 ```json
 {
@@ -58,7 +67,7 @@ Probes the DB, Ollama (`/api/tags`), and SearXNG. Overall `status` is
 
 ### `POST /papers/upload`
 
-Source: [endpoints/documents.py](../backend/app/api/v1/endpoints/documents.py).
+Source: [endpoints/documents.py](../../backend/app/api/v1/endpoints/documents.py).
 
 Multipart upload of a single PDF.
 
@@ -100,7 +109,7 @@ Response:
 }
 ```
 
-`DocumentResponse` ([schemas/documents.py](../backend/app/schemas/documents.py)):
+`DocumentResponse` ([schemas/documents.py](../../backend/app/schemas/documents.py)):
 
 ```ts
 {
@@ -173,7 +182,7 @@ the LLM to fix reading order for two-column / complex layouts.
 
 ## Chunks
 
-Source: [endpoints/chunks.py](../backend/app/api/v1/endpoints/chunks.py).
+Source: [endpoints/chunks.py](../../backend/app/api/v1/endpoints/chunks.py).
 
 ### `GET /papers/{paper_id}/chunks`
 
@@ -241,7 +250,7 @@ Returns VLM-generated technical descriptions for every figure in the paper.
 
 ## Ask
 
-Source: [endpoints/ask.py](../backend/app/api/v1/endpoints/ask.py).
+Source: [endpoints/ask.py](../../backend/app/api/v1/endpoints/ask.py).
 
 ### `POST /papers/{paper_id}/ask`
 
@@ -316,7 +325,7 @@ Returns every distinct conversation thread for a paper:
 
 ## Search (debug endpoints)
 
-Source: [endpoints/search.py](../backend/app/api/v1/endpoints/search.py). Not
+Source: [endpoints/search.py](../../backend/app/api/v1/endpoints/search.py). Not
 called by the standard UI but useful for testing retrieval directly.
 
 ### `GET /search/vector?q=...&document_id=<uuid>&limit=10`
@@ -333,7 +342,7 @@ ranking that EXTERNAL would apply.
 
 ## Errors
 
-[`api/errors.py`](../backend/app/api/errors.py) registers two
+[`api/errors.py`](../../backend/app/api/errors.py) registers two
 domain exceptions:
 
 | Exception          | HTTP | Body                                        |
@@ -348,6 +357,6 @@ Body too large causes `413` with description. Internal failures return
 
 ## Lifecycle headers
 
-CORS ([main.py](../backend/app/main.py)) allows the dev origins:
+CORS ([main.py](../../backend/app/main.py)) allows the dev origins:
 `localhost:5173`, `localhost:3000`, `127.0.0.1:5173`. Methods and
 headers are wide-open (`*`).

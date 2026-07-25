@@ -1,5 +1,21 @@
 # Chat & /ask
 
+> **What this is:** how a question becomes a grounded, cited answer — routing, retrieval, prompt
+> assembly, synthesis, persistence, compaction.
+>
+> **Owns:** the four context routes, the guardrail, the research agent, citation hygiene.
+> **Does not own:** which model serves each call ([ai-backend.md](ai-backend.md)), where the
+> external results come from ([plans/exa-firecrawl-research-stack.md](../plans/exa-firecrawl-research-stack.md)).
+>
+> **Companions:** [overview.md](overview.md) — system context ·
+> [api.md](../03-reference/api.md) — the `/ask` request and response shapes ·
+> [database-schema.md](../03-reference/database-schema.md) — `conversation_turns`, `ask_traces`.
+>
+> **Status:** current · **Last verified:** 2026-07-25 against
+> [`chat/orchestrator.py`](../../backend/app/chat/orchestrator.py)
+> **Verify with:** the `ASK[stepN]` log lines emitted on every question
+> **Volatile:** the EXTERNAL section — the provider is being replaced.
+
 The chat is the second half of the product. The reading view shows
 structural chunks one at a time. The `/ask` endpoint takes a user
 question, **decides what kind of context to retrieve**, builds that
@@ -14,7 +30,7 @@ context, calls a local LLM, and returns a grounded answer with citations.
 | OVERVIEW | The question is paper-level ("summarize the paper")        | Pre-computed section_summaries (hierarchical) | `system + "Context:\n<structured outline>"`                   |
 | EXTERNAL | The question is about something outside the paper          | Top-K web results from SearXNG                | `system + "Context:\n<title/url/snippet rows>"`               |
 
-## The flow ([chat/orchestrator.py](../backend/app/chat/orchestrator.py))
+## The flow ([chat/orchestrator.py](../../backend/app/chat/orchestrator.py))
 
 ```python
 async def handle_ask(session, *, prompt, document_id, current_chunk_id, conversation_id):
@@ -67,7 +83,7 @@ async def handle_ask(session, *, prompt, document_id, current_chunk_id, conversa
     return AskResponse(answer, context_type, router_reason, citations, model, conversation_id)
 ```
 
-## The router ([chat/router.py](../backend/app/chat/router.py))
+## The router ([chat/router.py](../../backend/app/chat/router.py))
 
 Two-tier:
 
@@ -89,7 +105,7 @@ Special cases:
 
 Each decision carries a `reason` string stored in `ask_traces.router_reason`.
 
-## LOCAL context ([chat/local_context.py](../backend/app/chat/local_context.py))
+## LOCAL context ([chat/local_context.py](../../backend/app/chat/local_context.py))
 
 1. Fetches a **window** of chunks centered on `current_chunk_id` (default ±1).
 2. Fetches every `chunk_assets` row for any chunk in the window.
@@ -97,33 +113,33 @@ Each decision carries a `reason` string stored in `ask_traces.router_reason`.
 
 If the current chunk is a figure, the model literally sees the picture.
 
-## GLOBAL context ([chat/global_context.py](../backend/app/chat/global_context.py))
+## GLOBAL context ([chat/global_context.py](../../backend/app/chat/global_context.py))
 
 1. Calls `get_query_embedding(prompt)` — embeds the query with the active embedding backend (same resolver as ingestion, so query and stored vectors always match).
 2. Calls `embeddings.search_embeddings` — pgvector cosine-similarity.
 3. Returns top-K (default 3) chunks.
 4. Surfaces images attached to retrieved chunks for inline rendering.
 
-## OVERVIEW context ([chat/overview_context.py](../backend/app/chat/overview_context.py))
+## OVERVIEW context ([chat/overview_context.py](../../backend/app/chat/overview_context.py))
 
 1. Fetches all `section_summaries` rows (level 0 + level 1 + level 2).
 2. Formats them as a structured document outline.
 3. Citations come from each summary's `source_chunk_ids`.
 
-## EXTERNAL context ([chat/external_context.py](../backend/app/chat/external_context.py))
+## EXTERNAL context ([chat/external_context.py](../../backend/app/chat/external_context.py))
 
 1. Calls SearXNG with the raw prompt.
 2. Ranks results via `search/ranking.py` (dedup + scoring).
 3. Returns at most 5 results.
 
-## Research Agent ([chat/research_agent.py](../backend/app/chat/research_agent.py))
+## Research Agent ([chat/research_agent.py](../../backend/app/chat/research_agent.py))
 
 For complex queries, an iterative research loop:
 - Tools: `web_search`, `read_paper_section`, `describe_figure`.
 - Maintains a research log and synthesizes a final response.
 - Triggered when the LLM emits a `NEEDS_RESEARCH` signal.
 
-## Multimodal request shape ([llm/multimodal.py](../backend/app/llm/multimodal.py))
+## Multimodal request shape ([llm/multimodal.py](../../backend/app/llm/multimodal.py))
 
 ```python
 messages = [
@@ -136,7 +152,7 @@ messages = [
 
 The client POSTs to `{OLLAMA_BASE_URL}/api/chat` with `stream: false`.
 
-## Citations ([chat/citations.py](../backend/app/chat/citations.py))
+## Citations ([chat/citations.py](../../backend/app/chat/citations.py))
 
 Two builders:
 - `citations_from_chunks` → `chunk_id`, `sequence_id`, `page`, `text_snippet`, `source="document"`.

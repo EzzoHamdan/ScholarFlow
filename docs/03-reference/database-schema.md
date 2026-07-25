@@ -1,7 +1,20 @@
-# Database Schema
+# Database schema
 
-Canonical schema is in [database/schema.sql](../backend/app/database/schema.sql).
-It is applied on startup by [database/migrations.py](../backend/app/database/migrations.py)
+> **What this is:** every table and column, with the relationships between them. Look-up only.
+>
+> **Owns:** table/column meanings and FK behavior.
+> **Does not own:** how the schema is applied ([migrations.md](migrations.md)), what the data
+> means in flow ([overview.md](../02-architecture/overview.md)).
+>
+> **Status:** current · **Last verified:** 2026-07-25 against
+> [`database/schema.sql`](../../backend/app/database/schema.sql)
+> **Verify with:** `\d+ <table>` in psql — the live database is authoritative
+>
+> ⚠ One FK deviates from the pattern: `conversation_turns.document_id` is `ON DELETE SET NULL`,
+> not `CASCADE`, so chat history survives paper deletion. Everything else cascades.
+
+Canonical schema is in [database/schema.sql](../../backend/app/database/schema.sql).
+It is applied on startup by [database/migrations.py](../../backend/app/database/migrations.py)
 (idempotent `CREATE TABLE IF NOT EXISTS …`).
 
 Two Postgres extensions are required: `vector` (pgvector) and `uuid-ossp`.

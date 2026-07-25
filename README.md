@@ -35,7 +35,7 @@ Everything runs locally by default. Your documents and conversations never leave
 | **LLM** | Ollama (Gemma 4, etc.) or GPT-4o / Claude / Gemini / Grok / DeepSeek | Same auto-fallback chain: local first, cloud only if needed — no config switching |
 | **PDF extraction** | **MinerU** 3.x (with PyMuPDF fallback) | State-of-the-art structural extraction: OCR, table recognition, equation → LaTeX |
 | **Background jobs** | Celery + Redis | Heavy extraction and embedding runs asynchronously so uploads never hang |
-| **Web search** | SearXNG (self-hosted metasearch) | EXTERNAL answers without sending every query to a single commercial engine |
+| **Web search** | SearXNG (self-hosted metasearch) | EXTERNAL answers without sending every query to a single commercial engine. **Being replaced** by Exa (semantic search) + Firecrawl (page → clean markdown) so the research agent reads sources instead of summarising search snippets — see [the migration plan](docs/plans/exa-firecrawl-research-stack.md) |
 | **Vector index** | pgvector HNSW | Fast approximate nearest neighbors inside Postgres; no extra service to run |
 
 ---
@@ -110,6 +110,24 @@ cd backend
 ./start-lan-server.sh
 ```
 It builds the full stack, removes upload limits, prints the exact LAN URL, and tears everything down cleanly on `Ctrl+C`.
+
+---
+
+## Documentation
+
+Full docs live in [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md), which routes you
+to the right document by task.
+
+| Want to… | Go to |
+| --- | --- |
+| Get it running | [docs/01-orientation/setup.md](docs/01-orientation/setup.md) |
+| Fix something broken | [docs/01-orientation/operations.md](docs/01-orientation/operations.md) |
+| Understand the system | [docs/02-architecture/overview.md](docs/02-architecture/overview.md) |
+| Look something up | [docs/03-reference/](docs/03-reference/) |
+| See what's missing | [docs/roadmap.md](docs/roadmap.md) |
+
+A sample paper for testing ingestion ships at
+[`samples/attention-is-all-you-need.pdf`](samples/).
 
 ---
 

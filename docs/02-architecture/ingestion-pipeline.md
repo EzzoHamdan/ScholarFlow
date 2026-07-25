@@ -1,4 +1,19 @@
-# Ingestion Pipeline
+# Ingestion pipeline
+
+> **What this is:** the path a PDF takes from upload to readable, chunk by chunk.
+>
+> **Owns:** extraction, chunking, asset handling, embedding, and summarization order.
+> **Does not own:** how chunks are retrieved at question time ([chat-and-ask.md](chat-and-ask.md)),
+> where files land on disk ([storage.md](../03-reference/storage.md)).
+>
+> **Companions:** [overview.md](overview.md) — system context ·
+> [ai-backend.md](ai-backend.md) — which model embeds and summarizes ·
+> [operations.md](../01-orientation/operations.md) — repairing a stuck ingestion.
+>
+> **Status:** current · **Last verified:** 2026-07-25 against
+> [`extraction/pipeline_sync.py`](../../backend/app/extraction/pipeline_sync.py) and
+> [`workers/tasks.py`](../../backend/app/workers/tasks.py)
+> **Verify with:** `pytest tests/test_ingestion_pipeline.py -v`
 
 This is the path a PDF takes from "the user dragged it onto the library"
 to "I can read it chunk-by-chunk and ask grounded questions about it."
