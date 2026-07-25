@@ -52,21 +52,38 @@ poll /papers/{id}/progress every 1s
                                                     INSERT chunk_assets (link via markdown ref)
                                                       │
                                                       ▼
-                                                    UPDATE ingestion_jobs → 'embedding'
-                                                    embed_document.delay(doc_id)
-                                                    UPDATE ingestion_jobs → 'complete'
-                                                    UPDATE documents      → 'complete', page_count
+                                                    _should_skip_embeddings()
+                                                    UPDATE documents → embedding_mode
+                                                      │
+                                          ┌───────────┴───────────┐
+                                     embedded                 skipped
+                                          │                       │
+                                  job → 'embedding'       job → 'summarizing'
+                                  embed_document.delay()          │
+                                          │                       │
+                                    UPDATE documents → 'processing', page_count
+   │                                      │                       │
+   ▼                                      ▼                       │
+poll continues                   embed_document_chunks_sync()     │
+                                   → batches of 20 chunks         │
+                                   → INSERT chunk_embeddings      │
+                                          │                       │
+                                          └───────────┬───────────┘
+                                                      ▼
+                                          generate_section_summaries
+                                            → hierarchical summaries → section_summaries
+                                            → VLM figure descriptions → figure_descriptions
+                                            → _mark_document_and_job_complete()
    │                                                  │
    ▼                                                  ▼
-status == 'complete'                             embed_document_chunks_sync()
-   │                                                → batches of 20 chunks
-   ▼                                                → INSERT chunk_embeddings (vector(VECTOR_DIMENSION))
-switch to ReadingView                               → on completion: generate_section_summaries.delay()
-
-                                                    generate_section_summaries
-                                                      → hierarchical summaries → section_summaries
-                                                      → VLM figure descriptions → figure_descriptions
+status == 'complete'  ◄───────────────────────  documents + job → 'complete'
+   │
+   ▼
+switch to ReadingView
 ```
+
+⚠ `status='complete'` is set **once, at the very end**, by `generate_section_summaries` — not when
+embeddings are dispatched. Both the embedded and skipped branches converge there.
 
 ## Step 1 — Upload
 
@@ -131,14 +148,84 @@ Implementation:
 5. For each persisted chunk, look up its `image_refs` against the map.
    Each hit becomes an `INSERT INTO chunk_assets`.
 
-## Step 5 — Embedding
+## Step 5 — Embedding (conditional)
 
-1. `UPDATE ingestion_jobs SET status='embedding'`.
-2. `embed_document.delay(document_id)` dispatches to Celery.
-3. `UPDATE ingestion_jobs SET status='complete'`.
-4. `UPDATE documents SET status='complete', page_count=<pypdf count>`.
+The pipeline decides here whether this document needs embeddings at all, then dispatches the
+matching downstream task.
 
-The Celery worker:
+1. `_should_skip_embeddings()` — see [paper-only mode](#paper-only-mode-conditional-dispatch).
+2. `UPDATE documents SET embedding_mode, embedding_skip_reason` — recorded once, never re-derived.
+3. Branch:
+   - **embedded** (default): `UPDATE ingestion_jobs SET status='embedding'`, then
+     `embed_document.delay(document_id)`.
+   - **skipped**: `UPDATE ingestion_jobs SET status='summarizing'`, then
+     `generate_section_summaries.delay(document_id)` — the chain is re-attached here.
+4. `UPDATE documents SET status='processing', page_count=<pypdf count>`.
+
+⚠ **The pipeline does NOT mark the document complete.** Completion is set only by
+`_mark_document_and_job_complete` at the end of `generate_section_summaries`
+([`workers/tasks.py`](../../backend/app/workers/tasks.py)) — the single normal exit from the whole
+pipeline. Marking it complete here was the bug that made the UI report "done" while the worker was
+still embedding and describing figures.
+
+### Paper-only mode: conditional dispatch
+
+```text
+                     chunks persisted
+                            │
+                            ▼
+                  _should_skip_embeddings()
+              (PAPER_ONLY_MODE? · doc_kind != book?
+               · SUM(token_count) <= PAPER_ONLY_MAX_TOKENS?)
+                            │
+              ┌─────────────┴─────────────┐
+         embedded                      skipped
+              │                            │
+    job → 'embedding'             job → 'summarizing'
+    embed_document.delay()                 │
+              │                            │
+              ▼                            │
+    embed_document_chunks_sync()           │
+    → chunk_embeddings                     │
+              │                            │
+              └──────────┬─────────────────┘
+                         ▼
+          generate_section_summaries.delay()
+                         │
+                         ▼
+          _mark_document_and_job_complete()   ← the ONLY normal exit
+```
+
+```mermaid
+%%{init: {'themeVariables': {'fontFamily': 'ui-monospace, SFMono-Regular, Menlo, monospace', 'lineColor': '#8b949e'}}}%%
+flowchart TD
+    C[chunks persisted] --> G{{"_should_skip_embeddings()"}}
+    G -->|embedded| E1[job → embedding]
+    E1 --> E2[embed_document.delay]
+    E2 --> E3[(chunk_embeddings)]
+    E3 --> S
+    G -->|skipped| K1[job → summarizing]
+    K1 --> S[generate_section_summaries.delay]
+    S --> M[["_mark_document_and_job_complete()<br/>the ONLY normal exit"]]
+
+    classDef owned stroke:#3b82f6,stroke-width:2px
+    classDef term stroke:#10b981,stroke-width:2px
+    class G,E1,E2,K1,S owned
+    class M term
+```
+
+> ⚠ The **dispatcher** is conditional; the **chain** is not. Both branches must terminate at
+> `_mark_document_and_job_complete`. A skip path that simply dropped `embed_document` would leave
+> the document at `processing` forever — the frontend polls `/progress` every second and would
+> spin indefinitely with no error raised anywhere. Verified by
+> `tests/test_paper_only_mode.py::test_skipped_document_still_reaches_complete`.
+
+The gate is **measured token count**, not `doc_kind`. `doc_kind == 'book'` disqualifies a document,
+but it is a guard only: it defaults to `'paper'`, so every document predating the book/paper
+chooser already carries that label. Full rationale:
+[paper-only-embedding-skip.md](../plans/paper-only-embedding-skip.md).
+
+When embeddings run, the Celery worker:
 
 1. Opens its own DB session.
 2. Calls `embed_document_chunks_sync(session, document_id, batch_size=20)`.
@@ -149,7 +236,8 @@ The Celery worker:
 
 ## Step 6 — Summarization (background)
 
-After embeddings are done, `generate_section_summaries.delay()` fires:
+Reached from either branch of Step 5 — after embeddings when they run, directly from the pipeline
+when they are skipped. `generate_section_summaries`:
 
 1. Hierarchical section summarization (level 0 = paper, level 1 = H1, level 2 = H2).
 2. VLM figure descriptions for every `chunk_type='figure'` chunk.
@@ -165,7 +253,7 @@ can start reading and asking questions as soon as `status='complete'`.
 | `queued`                      | `queued`     | overlay: queued   |
 | `extracting`                  | `queued`     | overlay: extracting |
 | `chunking`                    | `queued`     | overlay: chunking |
-| `embedding`                   | `queued`     | overlay: embedding |
+| `embedding`                   | `queued`     | overlay: embedding · skipped entirely in paper-only mode |
 | `summarizing`                 | `complete`   | overlay closes    |
 | `complete`                    | `complete`   | flip to ReadingView |
 | `failed`                      | `failed`     | back to LibraryView |

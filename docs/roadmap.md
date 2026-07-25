@@ -25,6 +25,7 @@ The application code is more mature than the tooling around it. These are the ch
 | **Nothing is pinned** in `requirements.txt` | `fastapi`, `sqlalchemy`, `httpx` all float. A fresh install in six months may not work | Pin, or generate a lockfile |
 | ⚠ **`pyproject.toml` is gitignored** | It is not in the clone, so `pip install -e .` fails for everyone. Also why there is no lint/format config | Remove it from `.gitignore` and commit it |
 | **No linter or formatter** | No ruff/black/ESLint anywhere | Add ruff + an ESLint config |
+| ~~No pytest config~~ | ~~async fixtures in `conftest.py` were collected but never run, failing with an opaque `assert not self._finalizers`~~ | **Fixed 2026-07-26** — `backend/pytest.ini` sets `asyncio_mode = auto` |
 | **`.gitignore` ignores `*.env`** | Would also ignore `.env.example` if it were named `example.env` — fragile | Narrow the pattern |
 
 ## Testing
@@ -36,6 +37,12 @@ The application code is more mature than the tooling around it. These are the ch
   `chat/orchestrator.py` (1061 lines) and `extraction/chunker.py` (1141 lines).
 - ⚠ **`conftest.py` `TRUNCATE`s a real database.** Tests cannot run without live Postgres, and
   pointing them at a dev DB destroys it. There is no isolation and no throwaway-DB guard.
+- ⚠ **`test_chunk_sequence.py::test_embedding_batching_resumption_and_casting` fails** —
+  `psycopg2.errors.DataException: expected 1024 dimensions, not 4096`. The test mocks
+  `get_embeddings_batch_sync` with hardcoded 4096-dim vectors, bypassing the MRL truncation that
+  normally coerces them to `VECTOR_DIMENSION`. Pre-existing (verified by stashing unrelated
+  changes); it was simply invisible until `backend/pytest.ini` made the suite runnable. Fix by
+  mocking at the layer above the truncation, or by deriving the mock width from settings.
 - No frontend tests of any kind.
 
 ## Data & schema

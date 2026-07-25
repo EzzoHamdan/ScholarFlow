@@ -14,7 +14,8 @@
 > [ingestion-pipeline.md](../02-architecture/ingestion-pipeline.md) — the chain being cut ·
 > [chat-and-ask.md](../02-architecture/chat-and-ask.md) — the routes affected.
 >
-> **Status:** draft · **Reflects code as of:** 2026-07-25 (`main`, ad43845)
+> **Status:** S1 landed · S2-S4 pending · **Reflects code as of:** 2026-07-26
+> ⚠ `PAPER_ONLY_MODE` remains **off by default** — see §12 S2 before enabling it.
 > **Prerequisite:** a chat model with a large context. Verified against `gemma4:31b-cloud`
 > (262,144 tokens).
 
@@ -372,7 +373,7 @@ comparison be measured rather than assumed.**
 
 | Seg | Scope | Done when |
 | --- | --- | --- |
-| **S1** | Schema columns, `should_skip_embeddings`, conditional dispatcher, `_requeue_all_embeddings` filter. **No retrieval changes.** | A skipped paper reaches `status='complete'` with the same job-status sequence as an embedded one, and `chunk_embeddings` has zero rows for it. A vector-dimension change does not re-embed it. |
+| ~~**S1**~~ | ✅ **DONE 2026-07-26.** Schema columns, gate, conditional dispatcher, `_requeue_all_embeddings` filter, `CHUNKING→SUMMARIZING` transition. | ✅ Verified by `backend/tests/test_paper_only_mode.py` — 10 tests, all passing, including that a skipped document reaches `complete` with zero embeddings and is excluded from the re-queue. |
 | **S2** | FTS-only GLOBAL + stuffing fallback + `[seq:N]` citation labels. | On a skipped paper: a literal question is answered from FTS hits; a paraphrase question falls through to stuffing; **both produce citation chips that jump the reader to the right chunk.** |
 | **S3** | `POST /papers/{id}/backfill-embeddings`, figure-lookup fallback made explicit, `/search/vector` signalling. | A skipped paper can be promoted to embedded with no re-extraction, and behaves identically to one embedded at ingestion. |
 | **S4** | Measure it. Same paper both ways: ingestion wall-clock, per-question prompt tokens, answer quality on the §4 question pairs. | A table of real numbers lands in this doc, and the default for `PAPER_ONLY_MODE` is chosen from it rather than assumed. |

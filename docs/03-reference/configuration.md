@@ -99,6 +99,24 @@ cloud API — each cloud provider has its own `*_CHAT_MODEL` above.
 | `MINERU_PAGE_BATCH_SIZE` | `100` | Compose-only. Extract in page-range batches so peak RAM stays bounded on long books. `0` disables. |
 | `MAX_UPLOAD_SIZE_MB` | `100` | Hard cap on the upload body. |
 
+## Paper-only mode
+
+Skip the embedding pass for documents that fit whole in the chat model's context. Design and
+rationale: [paper-only-embedding-skip.md](../plans/paper-only-embedding-skip.md).
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `PAPER_ONLY_MODE` | `false` | Master switch. Default off so upgrading changes nothing. ⚠ Only segment S1 has landed — with this on, a skipped document's GLOBAL route degrades to full-text search alone until S2 adds the stuffing fallback. |
+| `PAPER_ONLY_MAX_TOKENS` | `50000` | Skip only when `SUM(chunks.token_count)` is at or below this. ⚠ Not set near the model's full window: the body shares it with the system prompt, history, and the answer — and `token_count` is a `len/4` heuristic that undercounts math and tables. |
+
+The decision is made **once, at ingestion**, and stored in `documents.embedding_mode`
+(`'embedded'` | `'skipped'`) with `embedding_skip_reason`. It is never re-derived, so changing
+either setting cannot retroactively reclassify a library that is already ingested.
+
+⚠ `doc_kind` is a **guard, not the gate**: a book is never skipped, but `doc_kind` defaults to
+`'paper'` for every document predating the book/paper chooser, so gating on it alone would sweep
+in the entire existing library. The gate is measured token count.
+
 ## Chat behavior
 
 | Key | Default | Purpose |
