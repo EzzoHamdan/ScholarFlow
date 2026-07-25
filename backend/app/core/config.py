@@ -123,6 +123,36 @@ class Settings(BaseSettings):
     def effective_vlm_model(self) -> str:
         return self.vlm_model or self.chat_model
 
+    # How many figure descriptions to generate concurrently at ingestion.
+    # The VLM calls are pure network I/O, so running them in a small thread
+    # pool turns total wall-clock from the SUM of every figure into roughly the
+    # slowest one. Measured 2026-07-25 on a 14-page paper: sequential was
+    # 190+210+72 = 472s, i.e. 86% of a 549s ingestion.
+    # Keep this modest — it is concurrent load on one inference endpoint, and a
+    # hosted one may rate-limit. 1 restores the old sequential behaviour.
+    vlm_max_concurrency: int = 4
+
+    # ── Latency tuning ──────────────────────────────────────────────────────
+    # Small, fast model used ONLY for cheap classification (router + guardrail).
+    # Leave empty to reuse chat_model. Pointing this at a 1–3B model (e.g.
+    # "llama3.2:3b", "gemma2:2b") removes two big-model calls from the critical
+    # path of every question — usually the single biggest /ask speedup.
+    classifier_model: str = ""
+    # How long Ollama keeps a model resident after a call. Without this the big
+    # chat model is unloaded between requests and every question pays a cold
+    # reload. "-1" = keep forever, "30m" = 30 minutes, "0" = unload immediately.
+    ollama_keep_alive: str = "30m"
+    # Cap the answer length so generation can't run away on slow hardware.
+    # 0 = uncapped (model decides). Classification calls are capped separately.
+    chat_num_predict: int = 0
+    # Skip the LLM topic-guardrail when the user is reading a paper. Paper Q&A is
+    # in-scope by definition, so this removes a whole model call per question.
+    guardrail_skip_in_paper: bool = True
+
+    @property
+    def effective_classifier_model(self) -> str:
+        return self.classifier_model or self.chat_model
+
     # ── Latency tuning ──────────────────────────────────────────────────────
     # Small, fast model used ONLY for cheap classification (router + guardrail).
     # Leave empty to reuse chat_model. Pointing this at a 1–3B model (e.g.
