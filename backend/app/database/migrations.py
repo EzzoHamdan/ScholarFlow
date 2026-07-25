@@ -66,6 +66,12 @@ async def _ensure_recent_columns() -> None:
         # 'embedded' so existing rows keep their behaviour on upgrade.
         "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_mode TEXT NOT NULL DEFAULT 'embedded'",
         "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_skip_reason TEXT",
+        # Which margin a note card sits in ('left' | 'right'). Added after the
+        # notes table shipped, so existing notes default to the right gutter.
+        "ALTER TABLE paper_notes ADD COLUMN IF NOT EXISTS margin_side TEXT NOT NULL DEFAULT 'right'",
+        # The model the reader picked, as distinct from the one the provider
+        # reported. Follow-ups read this so they stay on the original model.
+        "ALTER TABLE paper_notes ADD COLUMN IF NOT EXISTS requested_model TEXT",
         # Nested sub-threads for tangents (paper-free focus mode inside threads).
         # Main chat turns keep parent_turn_id = NULL. Sub-thread turns point to their parent.
         "ALTER TABLE conversation_turns ADD COLUMN IF NOT EXISTS parent_turn_id UUID REFERENCES conversation_turns(id) ON DELETE CASCADE",

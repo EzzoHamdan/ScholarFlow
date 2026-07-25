@@ -77,3 +77,7 @@ docs/tasks/
 # Evaluation corpus — 55 MB of arXiv PDFs, reproducible via
 # scripts/fetch_eval_corpus.sh. The two committed fixtures in samples/ stay.
 samples/eval/
+
+backend/output
+# Playwright MCP run artifacts (screenshots, snapshots, console logs)
+.playwright-mcp/

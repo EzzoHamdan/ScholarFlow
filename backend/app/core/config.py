@@ -153,26 +153,41 @@ class Settings(BaseSettings):
     def effective_classifier_model(self) -> str:
         return self.classifier_model or self.chat_model
 
-    # ── Latency tuning ──────────────────────────────────────────────────────
-    # Small, fast model used ONLY for cheap classification (router + guardrail).
-    # Leave empty to reuse chat_model. Pointing this at a 1–3B model (e.g.
-    # "llama3.2:3b", "gemma2:2b") removes two big-model calls from the critical
-    # path of every question — usually the single biggest /ask speedup.
-    classifier_model: str = ""
-    # How long Ollama keeps a model resident after a call. Without this the big
-    # chat model is unloaded between requests and every question pays a cold
-    # reload. "-1" = keep forever, "30m" = 30 minutes, "0" = unload immediately.
-    ollama_keep_alive: str = "30m"
-    # Cap the answer length so generation can't run away on slow hardware.
-    # 0 = uncapped (model decides). Classification calls are capped separately.
-    chat_num_predict: int = 0
-    # Skip the LLM topic-guardrail when the user is reading a paper. Paper Q&A is
-    # in-scope by definition, so this removes a whole model call per question.
-    guardrail_skip_in_paper: bool = True
+    # ── Ingest profile ──────────────────────────────────────────────────────
+    # "fast" (default): a paper is DONE the moment MinerU has extracted it and
+    # the chunker has run. No embedding pass, no section summaries, no VLM
+    # figure descriptions — nothing between dropping the PDF and reading it.
+    # Everything the model needs is derived at question time by
+    # app.chat.paper_agent (whole-document stuffing, or full-text SEARCH/READ
+    # over chunks when the paper is too large to stuff).
+    #
+    # "full": the historical chain (embeddings → summaries → figure
+    # descriptions), still honouring paper_only_mode below.
+    #
+    # ⚠ The profile only applies to doc_kind='paper'. Books are far too large
+    # to stuff or to full-text-scan usefully, so they always take the full
+    # chain regardless of this setting.
+    ingest_profile: str = "fast"
 
     @property
-    def effective_classifier_model(self) -> str:
-        return self.classifier_model or self.chat_model
+    def fast_ingest(self) -> bool:
+        return self.ingest_profile.strip().lower() == "fast"
+
+    # ── Paper agent (answering without embeddings) ──────────────────────────
+    # Stuff the ENTIRE document into the prompt when its measured token count
+    # is at or below this. Above it, the agent falls back to an iterative
+    # SEARCH/READ loop over chunks.
+    # ⚠ token_count is len(plain_text)/4 — a character heuristic that
+    # undercounts math and tables badly. Leave headroom below the real window.
+    whole_paper_max_tokens: int = 120_000
+    # How many SEARCH/READ rounds the agent may run before it is forced to
+    # answer with whatever it has gathered.
+    paper_agent_max_steps: int = 4
+    # Ceiling on how many chunks a single READ may pull back, so one greedy
+    # range request cannot blow the context window.
+    paper_agent_read_max_chunks: int = 40
+    # Ceiling on how many chunks a single SEARCH may return as hits.
+    paper_agent_search_limit: int = 8
 
     # ── Paper-only mode ─────────────────────────────────────────────────────
     # Skip the embedding pass for documents small enough to fit whole in the

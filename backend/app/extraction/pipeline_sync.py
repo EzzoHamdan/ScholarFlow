@@ -23,6 +23,7 @@ from app.extraction.chunker import (
     create_chunks_from_markdown,
 )
 from app.extraction.assets import move_asset_to_storage
+from app.extraction.glyph_repair import repair_chunks
 from app.extraction.jobs import JobStatus
 
 logger = get_logger(__name__)
@@ -122,6 +123,33 @@ def set_embedding_mode_sync(
         ),
         {"mode": mode, "reason": reason, "id": document_id},
     )
+
+
+def _is_fast_ingest(session: Session, document_id: UUID) -> bool:
+    """True when this document is DONE as soon as it is extracted and chunked.
+
+    Two gates, both required:
+
+    1. INGEST_PROFILE is "fast" (the default).
+    2. The document is not a book. A book cannot be stuffed into a context
+       window, so it still needs the embedding pass to be answerable; a paper
+       is served at question time by app.chat.paper_agent instead.
+
+    ⚠ Unlike _should_skip_embeddings this does NOT gate on token count. A
+    survey too large to stuff is still readable immediately, and the agent's
+    SEARCH/READ path covers it — there is nothing an embedding would buy that
+    full-text search over the same chunks does not.
+    """
+    from app.core.config import settings
+
+    if not settings.fast_ingest:
+        return False
+
+    row = session.execute(
+        text("SELECT doc_kind FROM documents WHERE id = :id"),
+        {"id": document_id},
+    ).mappings().first()
+    return not (row and row.get("doc_kind") == "book")
 
 
 def _should_skip_embeddings(session: Session, document_id: UUID) -> tuple[bool, str]:
@@ -261,6 +289,15 @@ def run_pipeline_sync(
         if not chunks:
             raise MinerUError("No structural chunks extracted from document")
 
+        # Step 2b: Undo MinerU's mangling of inline math variables. It writes
+        # U+FFFD wherever the paper used a Mathematical Alphanumeric Symbol
+        # (𝑛, 𝑚, 𝑇 …); the PDF still knows, so we read it back.
+        # See app/extraction/glyph_repair.py.
+        try:
+            repair_chunks(chunks, pdf_path)
+        except Exception:
+            logger.exception("[glyph-repair] failed (non-fatal, chunks kept as-is)")
+
         # Step 3: Handle physical image assets
         images = find_images(output_dir)
         asset_map = {}
@@ -324,8 +361,37 @@ def run_pipeline_sync(
         session.commit()
         logger.info(f"Synchronously persisted {len(chunks)} chunks and {len(asset_payloads)} assets for document {document_id}")
 
-        # Step 5: Decide whether this document needs embeddings at all, then
-        # dispatch the right downstream task.
+        # Page count is needed by both branches below — the fast path marks the
+        # document complete inline, so it cannot be deferred to the end.
+        page_count = get_page_count(pdf_path)
+
+        # Step 5a: Fast profile — extraction IS the pipeline. Mark the document
+        # complete right here and dispatch nothing.
+        #
+        # ⚠ This is the ONE place other than generate_section_summaries that
+        # sets status='complete'. That is deliberate and safe precisely because
+        # nothing is dispatched afterwards: there is no downstream task left to
+        # contradict it. Adding a dispatch to this branch without moving the
+        # completion would reintroduce the "UI says done while the worker is
+        # still running" bug.
+        if _is_fast_ingest(session, document_id):
+            set_embedding_mode_sync(
+                session, document_id, "skipped", "fast_ingest"
+            )
+            update_document_status_sync(
+                session, document_id, "complete", page_count=page_count
+            )
+            update_job_status_sync(session, job_id, JobStatus.COMPLETE)
+            session.commit()
+            logger.info(
+                f"[fast-ingest] Document {document_id} complete after extraction: "
+                f"{len(chunks)} chunks, {len(asset_payloads)} assets, {page_count} pages "
+                "— no embeddings, no summaries, no figure descriptions"
+            )
+            return
+
+        # Step 5b: Full profile — decide whether this document needs embeddings,
+        # then dispatch the right downstream task.
         #
         # ⚠ The dispatcher is conditional; the CHAIN IS NOT. Completion is only
         # ever set by generate_section_summaries (see workers/tasks.py), which
@@ -362,7 +428,6 @@ def run_pipeline_sync(
         # The document only becomes "complete" when that final task finishes.
         # Marking it complete here was the bug that made the UI report "done"
         # while the worker was still embedding and describing figures.
-        page_count = get_page_count(pdf_path)
         update_document_status_sync(session, document_id, "processing", page_count=page_count)
         session.commit()
 

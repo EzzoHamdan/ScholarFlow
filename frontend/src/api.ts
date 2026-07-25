@@ -176,6 +176,245 @@ export async function getNextChunk(paperId: string, afterSequence: number): Prom
   return res.json();
 }
 
+// ── Whole document (article reader) ──────────────────────────────────────────
+
+export interface DocBlock {
+  id: string;
+  sequence_order: number;
+  structural_type: string;
+  content_markdown: string;
+  plain_text: string;
+  heading_path: string[] | null;
+  page_start: number | null;
+  page_end: number | null;
+  table_json?: { headers?: string[]; rows?: string[][] } | null;
+  image_url: string | null;
+}
+
+export interface OutlineEntry {
+  sequence_order: number;
+  text: string;
+  level: number;
+}
+
+export interface FullDocument {
+  paper_id: string;
+  title: string;
+  doc_kind: string | null;
+  status: string;
+  page_count: number | null;
+  extractor: string | null;
+  blocks: DocBlock[];
+  outline: OutlineEntry[];
+  total: number;
+}
+
+/**
+ * Fetch the entire paper in one request. The article reader renders all of it;
+ * there is no paging, so there is no reason to make N round-trips for it.
+ */
+export async function getFullDocument(paperId: string): Promise<FullDocument> {
+  const res = await fetch(`${BASE}/papers/${paperId}/document`);
+  if (!res.ok) throw new Error(`Document fetch failed: ${res.status}`);
+  return res.json();
+}
+
+// ── Notes (anchored margin annotations) ──────────────────────────────────────
+
+export type AnchorKind = 'text' | 'figure' | 'equation' | 'block';
+export type MarginSide = 'left' | 'right';
+
+// ── Model catalog ────────────────────────────────────────────────────────────
+
+export interface ModelInfo {
+  name: string;
+  /** Run on Ollama's infrastructure rather than from local weights. */
+  is_cloud: boolean;
+  size_bytes: number;
+}
+
+export interface ModelCatalog {
+  models: ModelInfo[];
+  /** The model used when none is chosen explicitly. */
+  default: string;
+}
+
+/** Models available to answer a question, local first and cloud-hosted last. */
+export async function listModels(): Promise<ModelCatalog> {
+  const res = await fetch(`${BASE}/models`);
+  if (!res.ok) throw new Error(`Model list failed: ${res.status}`);
+  return res.json();
+}
+
+export interface NoteAnchor {
+  kind: AnchorKind;
+  sequence_id: number;
+  chunk_id?: string | null;
+  quote?: string | null;
+  image_url?: string | null;
+}
+
+export interface PaperNote {
+  id: string;
+  anchor_sequence_id: number;
+  anchor_chunk_id: string | null;
+  anchor_kind: AnchorKind;
+  anchor_quote: string | null;
+  anchor_image_path: string | null;
+  question: string;
+  answer: string;
+  cited_sequence_ids: number[];
+  retrieval_mode: string | null;
+  /** What the provider reported answering. Shown on the card. */
+  model: string | null;
+  /** What the reader picked. Follow-ups inherit this, never override it. */
+  requested_model: string | null;
+  margin_side: MarginSide;
+  parent_note_id: string | null;
+  created_at: string | null;
+}
+
+/** Move a note to the other margin. */
+export async function moveNote(
+  paperId: string,
+  noteId: string,
+  side: MarginSide,
+): Promise<void> {
+  const res = await fetch(`${BASE}/papers/${paperId}/notes/${noteId}/margin`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ margin_side: side }),
+  });
+  if (!res.ok) throw new Error(`Move failed: ${res.status}`);
+}
+
+export async function listNotes(paperId: string): Promise<PaperNote[]> {
+  const res = await fetch(`${BASE}/papers/${paperId}/notes`);
+  if (!res.ok) throw new Error(`Notes fetch failed: ${res.status}`);
+  const body = await res.json();
+  return body.notes || [];
+}
+
+export async function deleteNote(paperId: string, noteId: string): Promise<void> {
+  const res = await fetch(`${BASE}/papers/${paperId}/notes/${noteId}`, { method: 'DELETE' });
+  if (!res.ok && res.status !== 404) throw new Error(`Note delete failed: ${res.status}`);
+}
+
+export interface NoteStreamHandlers {
+  /** The note row exists — render the card now, before any answer arrives. */
+  onCreated: (noteId: string) => void;
+  /** What the agent is doing ("Searching: …", "Reading blocks 40–52"). */
+  onStatus: (message: string) => void;
+  /** Answer text, token by token. */
+  onToken: (text: string) => void;
+}
+
+export interface NoteResult {
+  note_id: string;
+  answer: string;
+  model: string;
+  retrieval_mode: string | null;
+  cited_sequence_ids: number[];
+}
+
+/**
+ * Ask a question anchored to a place in the paper. The note row is created
+ * server-side first (so a failed generation still leaves a visible, retryable
+ * card), then the answer streams in.
+ */
+export async function askNoteStream(
+  paperId: string,
+  question: string,
+  anchor: NoteAnchor,
+  parentNoteId: string | null,
+  handlers: NoteStreamHandlers,
+  signal?: AbortSignal,
+  /** Omit to let the server balance the two margins. */
+  marginSide?: MarginSide | null,
+  /** Omit for the configured default. Ignored by the server on follow-ups. */
+  model?: string | null,
+): Promise<NoteResult> {
+  const res = await fetch(`${BASE}/papers/${paperId}/notes/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      question,
+      anchor,
+      parent_note_id: parentNoteId,
+      margin_side: marginSide ?? null,
+      model: model ?? null,
+    }),
+  });
+  if (!res.ok || !res.body) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      // body not JSON; keep the status-only detail
+    }
+    throw new Error(detail);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let result: NoteResult | null = null;
+  let streamError: string | null = null;
+
+  const handleEvent = (raw: string) => {
+    let ev: Record<string, unknown>;
+    try {
+      ev = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    switch (ev.type) {
+      case 'created':
+        handlers.onCreated(String(ev.note_id ?? ''));
+        break;
+      case 'status':
+        handlers.onStatus(String(ev.message ?? ''));
+        break;
+      case 'token':
+        handlers.onToken(String(ev.text ?? ''));
+        break;
+      case 'error':
+        streamError = String(ev.detail || 'Note generation failed');
+        break;
+      case 'done':
+        result = {
+          note_id: String(ev.note_id ?? ''),
+          answer: String(ev.answer ?? ''),
+          model: String(ev.model ?? ''),
+          retrieval_mode: (ev.retrieval_mode as string) ?? null,
+          cited_sequence_ids: (ev.cited_sequence_ids as number[]) || [],
+        };
+        break;
+    }
+  };
+
+  // SSE framing: events separated by a blank line, each one `data: {json}`.
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('data:')) handleEvent(line.slice(5).trim());
+      }
+    }
+  }
+
+  if (streamError) throw new Error(streamError);
+  if (!result) throw new Error('Note stream ended unexpectedly');
+  return result;
+}
+
 export interface Chapter {
   index: number;
   title: string;

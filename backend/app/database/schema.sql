@@ -244,3 +244,74 @@ CREATE INDEX IF NOT EXISTS idx_section_summaries_document
 
 CREATE INDEX IF NOT EXISTS idx_section_summaries_document_created
     ON section_summaries(document_id, created_at DESC);
+
+-- ============================================================================
+-- Paper notes: the margin annotations that replaced the side chat.
+--
+-- One row is one question the reader asked about a specific place in the paper,
+-- plus the answer, rendered as a card in the right margin beside its anchor.
+--
+-- Deliberately NOT stored in conversation_turns. A note is a different artifact:
+-- it is anchored to a location, it is one Q+A pair rather than a rolling
+-- transcript, and none of the conversation machinery (routing, compaction,
+-- sub-threads) applies to it. Sharing that table would mean every note carried
+-- five columns it never uses and appeared in the chat history endpoints.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS paper_notes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+    -- Where the note hangs. anchor_sequence_id is the durable anchor and is
+    -- what the reader positions by. anchor_chunk_id is a convenience that goes
+    -- NULL if the paper is re-chunked. Keeping both means a re-chunk degrades
+    -- the anchor's precision instead of destroying the note.
+    anchor_chunk_id UUID REFERENCES chunks(id) ON DELETE SET NULL,
+    anchor_sequence_id INTEGER NOT NULL,
+
+    -- 'text'   the reader highlighted a passage, held in anchor_quote
+    -- 'figure' the reader picked a figure, located by anchor_image_path
+    -- 'block'  no selection, so the note hangs off the block in view
+    -- (no semicolons in these comments: the migration runner splits on them)
+    anchor_kind TEXT NOT NULL DEFAULT 'text',
+    anchor_quote TEXT,
+    anchor_image_path TEXT,
+
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL DEFAULT '',
+
+    -- Which sequence_ids the model actually leaned on, so the card can offer
+    -- "jump to §3.2" chips that scroll the article.
+    cited_sequence_ids INTEGER[],
+    -- 'whole' when the paper fitted in the context window, 'agent' when the
+    -- SEARCH/READ loop ran. Surfaced in the card so the reader knows whether
+    -- the answer saw everything or went looking.
+    retrieval_mode TEXT,
+
+    -- model: what the provider reported answering (shown on the card, so two
+    -- notes asking the same question of different models can be compared).
+    -- requested_model: what the reader actually picked. Kept separately
+    -- because a provider may report a resolved variant, and because it is the
+    -- authoritative value for follow-ups, which must stay on the model the
+    -- note was started with.
+    model TEXT,
+    requested_model TEXT,
+
+    -- Which margin the card sits in. Chosen automatically when the note is
+    -- created (whichever side is less crowded at that anchor) and overridable
+    -- per note, so a card can be moved off a figure it happens to cover.
+    -- Ignored on windows too narrow for two gutters.
+    margin_side TEXT NOT NULL DEFAULT 'right',
+
+    -- Follow-ups chain off their parent so a note can become a short thread
+    -- without leaving the margin.
+    parent_note_id UUID REFERENCES paper_notes(id) ON DELETE CASCADE,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_notes_document
+    ON paper_notes(document_id, anchor_sequence_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_paper_notes_parent
+    ON paper_notes(parent_note_id);

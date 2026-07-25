@@ -20,7 +20,12 @@ TRANSITIONS: dict[JobStatus, list[JobStatus]] = {
     # CHUNKING -> SUMMARIZING is the paper-only skip path: when the embedding
     # pass is skipped, the pipeline dispatches generate_section_summaries
     # directly, so the job never passes through EMBEDDING.
-    JobStatus.CHUNKING: [JobStatus.EMBEDDING, JobStatus.SUMMARIZING, JobStatus.FAILED],
+    # CHUNKING -> COMPLETE is the fast-ingest path (INGEST_PROFILE=fast): for a
+    # paper, extraction IS the pipeline — nothing is dispatched afterwards, so
+    # the job terminates the moment the chunks are persisted.
+    JobStatus.CHUNKING: [
+        JobStatus.EMBEDDING, JobStatus.SUMMARIZING, JobStatus.COMPLETE, JobStatus.FAILED,
+    ],
     JobStatus.EMBEDDING: [JobStatus.SUMMARIZING, JobStatus.COMPLETE, JobStatus.FAILED],
     JobStatus.SUMMARIZING: [JobStatus.COMPLETE, JobStatus.FAILED],
     JobStatus.COMPLETE: [],
