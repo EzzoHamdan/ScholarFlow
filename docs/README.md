@@ -3,7 +3,7 @@
 > **What this is:** the dispatcher for every doc in this repo. Find your task in the table, start
 > at the named doc, verify with the named command. This page routes; it never explains.
 >
-> **Status:** current · **Reflects code as of:** 2026-07-25 (`main`, ad43845)
+> **Status:** current · **Reflects code as of:** 2026-07-25 (`main`, 9b75500)
 > **Rule:** when a doc and the code disagree, **the code is authoritative** — and the doc is a
 > defect to be fixed in the same unit of work.
 
@@ -18,7 +18,7 @@
 | Diagnose something broken | [01-orientation/operations.md](01-orientation/operations.md) | `ask_traces` / `ingestion_jobs` queries in that doc |
 | Understand the system end-to-end | [02-architecture/overview.md](02-architecture/overview.md) | — |
 | Trace a PDF from upload to readable | [02-architecture/ingestion-pipeline.md](02-architecture/ingestion-pipeline.md) | `tests/test_ingestion_pipeline.py` |
-| Understand how a question gets answered | [02-architecture/chat-and-ask.md](02-architecture/chat-and-ask.md) | `ASK[stepN]` log lines |
+| Understand how a question gets answered | [02-architecture/chat-and-ask.md](02-architecture/chat-and-ask.md) | `NOTE[...]` / `ASK[stepN]` log lines |
 | Know which model serves which call | [02-architecture/ai-backend.md](02-architecture/ai-backend.md) | `tests/test_provider_resolver.py` |
 | Work on the React UI | [02-architecture/frontend.md](02-architecture/frontend.md) | `npm run build` |
 | Look up an endpoint | [03-reference/api.md](03-reference/api.md) | `localhost:8000/docs` |
@@ -26,7 +26,7 @@
 | Set an environment variable | [03-reference/configuration.md](03-reference/configuration.md) | `backend/app/core/config.py` |
 | Find a file on disk / a static URL | [03-reference/storage.md](03-reference/storage.md) | `ls backend/app/storage` |
 | Change the schema | [03-reference/migrations.md](03-reference/migrations.md) | restart the API; watch migration logs |
-| Test a release | [04-testing/test-plan.md](04-testing/test-plan.md) | `cd backend && pytest -v` |
+| Test a release | [04-testing/test-plan.md](04-testing/test-plan.md) | `cd backend && POSTGRES_DB=9xaipal_test pytest -v` |
 | Know what's broken or missing by design | [roadmap.md](roadmap.md) | — |
 | Read or write a plan | [plans/](plans/) | — |
 
@@ -39,9 +39,15 @@ strings, not for synonyms.
 
 | Term | Means |
 | --- | --- |
-| **chunk** | One structural unit of a document — heading, paragraph, math block, table, or figure. Row in `chunks`. The atom of both reading and retrieval. |
+| **chunk** | One structural unit of a document — heading, paragraph, math block, table, or figure. Row in `chunks`. The atom of reading, retrieval, and note anchoring. |
+| **block** | A chunk as the article reader renders it. Same row, reader-facing name — `data-seq` on the DOM element is its `sequence_id`. |
+| **note** | One anchored question + answer, rendered in the reader's margin. Row in `paper_notes`. The paper equivalent of a chat turn. |
+| **anchor** | Where a note hangs: `anchor_sequence_id` plus an `anchor_kind` of `text`, `figure`, `equation`, or `block`. |
+| **ingest profile** | `INGEST_PROFILE` — `fast` (a paper is done at chunking) or `full` (the historical embed → summarize chain). Books always take `full`. |
+| **paper agent** | `chat/paper_agent.py` — answers a note without embeddings, by stuffing the whole document or by driving `SEARCH`/`READ` over chunks. |
+| **retrieval_mode** | Which of those two the agent used for a given note: `whole` or `agent`. |
 | **`sequence_id`** | 1-based physical reading order within a document. The source of truth for order; vector similarity never redefines it. |
-| **route / `context_type`** | Which context source answers a question: `LOCAL`, `GLOBAL`, `OVERVIEW`, `EXTERNAL`, or `OUT_OF_SCOPE`. Chosen per question by `chat/router.py`. |
+| **route / `context_type`** | Which context source answers a `/ask` question: `LOCAL`, `GLOBAL`, `OVERVIEW`, `EXTERNAL`, or `OUT_OF_SCOPE`. Chosen by `chat/router.py`. ⚠ Applies to books only — notes are never routed. |
 | **LOCAL** | Current chunk + neighbours + inline images. |
 | **GLOBAL** | pgvector similarity search across one document. |
 | **OVERVIEW** | Pre-computed hierarchical summaries (`section_summaries`), no vector search. |

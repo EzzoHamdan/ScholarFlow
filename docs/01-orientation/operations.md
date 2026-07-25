@@ -89,7 +89,7 @@ ORDER BY last DESC;
 ```sql
 DELETE FROM documents WHERE id = '<uuid>';
 -- cascades: chunks, chunk_embeddings, chunk_assets, section_summaries,
---           figure_descriptions, ingestion_jobs
+--           figure_descriptions, ingestion_jobs, paper_notes
 -- conversation_turns survive with document_id = NULL
 ```
 
@@ -107,6 +107,24 @@ WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = '<uuid>');
 ```
 
 Then `POST /papers/{id}/rechunk`, which re-queues `embed_document`.
+
+⚠ Under `INGEST_PROFILE=fast` a paper has no embeddings to re-queue and `/rechunk` dispatches
+nothing — it is answered live by the paper agent instead. The response says which happened.
+
+### Repair figures or mangled inline math on an existing paper
+
+`POST /papers/{id}/rechunk` also, in one pass:
+
+- re-links every figure to its image (see the landmine below),
+- attaches MinerU's cropped bitmap to each `math` chunk,
+- runs the U+FFFD glyph repair, reporting `glyphs_repaired` in the response.
+
+It reuses the cached MinerU output, so it costs seconds rather than a re-extraction. Notes survive
+— they anchor on `sequence_id`, not on chunk ids.
+
+⚠ **Any browser tab opened before a re-chunk holds stale block ids.** The notes endpoint re-resolves
+the anchor from `sequence_id` for exactly this reason, but reload the reader anyway to see the new
+chunking.
 
 ### Repair ladder — cheapest first
 

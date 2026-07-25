@@ -6,7 +6,7 @@
 > **Does not own:** why a route behaves as it does ([chat-and-ask.md](../02-architecture/chat-and-ask.md)).
 >
 > **Status:** current · **Last verified:** 2026-07-25 against
-> [`api/v1/router.py`](../../backend/app/api/v1/router.py)
+> [`api/v1/router.py`](../../backend/app/api/v1/router.py) (`main`, 9b75500)
 > **Verify with:** `http://localhost:8000/docs` (live OpenAPI, always authoritative)
 
 All endpoints live under the prefix **`/api/v1`** and are registered in
@@ -24,12 +24,21 @@ POST   /papers/{paper_id}/rechunk
 POST   /papers/{paper_id}/reextract
 POST   /papers/{paper_id}/regenerate-summaries
 POST   /papers/{paper_id}/reconstruct-reading-order
+GET    /papers/{paper_id}/document
 GET    /papers/{paper_id}/chunks
 GET    /papers/{paper_id}/chunks/{sequence_order}
+GET    /papers/{paper_id}/chunks/after/{sequence_order}
+GET    /papers/{paper_id}/chapters
 GET    /papers/{paper_id}/figure-descriptions
+GET    /papers/{paper_id}/notes
+POST   /papers/{paper_id}/notes/stream
+PATCH  /papers/{paper_id}/notes/{note_id}/margin
+DELETE /papers/{paper_id}/notes/{note_id}
 POST   /papers/{paper_id}/ask
+POST   /papers/{paper_id}/ask/stream
 GET    /papers/{paper_id}/chat
 GET    /papers/{paper_id}/conversations
+GET    /models
 GET    /search/vector
 GET    /search/web
 ```
@@ -184,6 +193,43 @@ the LLM to fix reading order for two-column / complex layouts.
 
 Source: [endpoints/chunks.py](../../backend/app/api/v1/endpoints/chunks.py).
 
+### `GET /papers/{paper_id}/document`
+
+**The article reader's only load.** Returns every block of the paper plus its heading spine, in
+one response — chunks and their image assets are fetched in two queries and joined in memory.
+
+⚠ Deliberately unpaginated. The reader renders the whole paper at once; the previous approach
+walked `/chunks/after/{seq}` once per chunk, costing 105 sequential round-trips on a 14-page
+paper before a single word appeared.
+
+```json
+{
+  "paper_id": "<uuid>",
+  "title": "<original filename without extension>",
+  "doc_kind": "paper" | "book",
+  "status": "<document status>",
+  "page_count": <int|null>,
+  "extractor": "mineru" | "pymupdf_fallback" | null,
+  "blocks": [
+    {
+      "id": "<uuid>", "sequence_order": <int>,
+      "structural_type": "text|heading|math|table|figure|code|footnote",
+      "content_markdown": "...", "plain_text": "...",
+      "heading_path": ["..."] | null,
+      "page_start": <int|null>, "page_end": <int|null>,
+      "table_json": {"headers": [...], "rows": [[...]]} | null,
+      "image_url": "/static/images/<doc_id>/<file>" | null
+    }
+  ],
+  "outline": [{"sequence_order": <int>, "text": "...", "level": <int>}],
+  "total": <int>
+}
+```
+
+⚠ `image_url` is populated for `figure` **and** `math` blocks — MinerU crops a bitmap of every
+equation alongside its LaTeX, and the reader hands that crop to the model when a question is
+anchored to a formula.
+
 ### `GET /papers/{paper_id}/chunks`
 
 List all chunks in sequence order.
@@ -245,6 +291,115 @@ Returns VLM-generated technical descriptions for every figure in the paper.
   }, ...]
 }
 ```
+
+---
+
+## Notes
+
+Source: [endpoints/notes.py](../../backend/app/api/v1/endpoints/notes.py). Behaviour:
+[chat-and-ask.md](../02-architecture/chat-and-ask.md).
+
+A **note** is one question anchored to a place in a paper, plus its answer, rendered as a card in
+the reader's margin. Notes live in `paper_notes` — not in `conversation_turns` — because they are
+a different artifact: anchored, one Q+A per row, and untouched by routing, compaction, or
+sub-threads.
+
+### `GET /papers/{paper_id}/notes`
+
+Every note on the paper, ordered by `anchor_sequence_id` then `created_at` — the same order the
+margin lays them out in.
+
+```json
+{"notes": [
+  {
+    "id": "<uuid>",
+    "anchor_sequence_id": <int>, "anchor_chunk_id": "<uuid>|null",
+    "anchor_kind": "text|figure|equation|block",
+    "anchor_quote": "<the highlighted passage>|null",
+    "anchor_image_path": "<doc_id>/<file>|null",
+    "question": "...", "answer": "...",
+    "cited_sequence_ids": [<int>],
+    "retrieval_mode": "whole" | "agent" | null,
+    "model": "<what the provider reported>|null",
+    "requested_model": "<what the reader picked>|null",
+    "margin_side": "left" | "right",
+    "parent_note_id": "<uuid>|null",
+    "created_at": "<iso8601>"
+  }
+]}
+```
+
+### `POST /papers/{paper_id}/notes/stream`
+
+Create a note and stream its answer as Server-Sent Events.
+
+```json
+{
+  "question": "why is tau so small here?",
+  "anchor": {
+    "kind": "text|figure|equation|block",
+    "sequence_id": <int>,
+    "chunk_id": "<uuid>|null",
+    "quote": "<selected text, or a figure caption / equation LaTeX>|null",
+    "image_url": "/static/images/...|null"
+  },
+  "parent_note_id": "<uuid>|null",
+  "margin_side": "left" | "right" | null,
+  "model": "<model name>|null"
+}
+```
+
+Event types, one JSON object per `data:` line:
+
+| Event | Payload | Meaning |
+| --- | --- | --- |
+| `created` | `note_id` | The row exists — render the card now. |
+| `status` | `message` | What the agent is doing (`Searching: …`, `Reading blocks 40–52`). |
+| `token` | `text` | Answer text as it generates. |
+| `done` | `note_id`, `answer`, `model`, `retrieval_mode`, `cited_sequence_ids` | Final state. |
+| `error` | `detail` | Generation failed; the row survives with an empty answer. |
+
+⚠ Three fields in the request are **advisory and can be overridden by the server**:
+
+- `anchor.chunk_id` is always re-resolved from `sequence_id`. Re-chunking recreates every row with
+  fresh UUIDs, so a tab opened before a re-chunk holds ids that no longer exist — inserting one
+  violates the foreign key and 500s the request.
+- `model` is **ignored entirely when `parent_note_id` is set**. A follow-up always uses the
+  parent's `requested_model`. A thread that switched models halfway would destroy the comparison
+  the picker exists for.
+- `margin_side` defaults to whichever margin is less crowded near the anchor; a follow-up inherits
+  its parent's side.
+
+### `PATCH /papers/{paper_id}/notes/{note_id}/margin`
+
+Body `{"margin_side": "left" | "right"}` → `{"id", "margin_side"}`. 400 on any other value.
+
+### `DELETE /papers/{paper_id}/notes/{note_id}`
+
+`204`. Follow-ups cascade with the root.
+
+---
+
+## Models
+
+Source: [endpoints/models.py](../../backend/app/api/v1/endpoints/models.py),
+[llm/catalog.py](../../backend/app/llm/catalog.py).
+
+### `GET /models`
+
+Models that can answer a note, local first and cloud-hosted last.
+
+```json
+{
+  "models": [{"name": "gemma4:26b", "is_cloud": false, "size_bytes": 18000000000}],
+  "default": "<the resolver's current chat model>"
+}
+```
+
+Read from Ollama's `/api/tags`. A model is `is_cloud` when its name ends in `cloud` **or** it
+reports `size_bytes: 0` — a cloud entry carries no local weights. Embedding models are filtered
+out; they appear in the same tag list but cannot hold a conversation. Falls back to the single
+configured cloud model when Ollama is unreachable.
 
 ---
 

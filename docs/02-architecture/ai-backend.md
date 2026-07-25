@@ -117,12 +117,31 @@ deliberate: a large local model on cold start will blow through any default, and
 
 | Role | Ollama model | Cloud model | Called from | Frequency |
 | --- | --- | --- | --- | --- |
-| `chat` | `CHAT_MODEL` | `*_CHAT_MODEL` | orchestrator, synthesis | 1× per question |
+| `chat` | `CHAT_MODEL` | `*_CHAT_MODEL` | orchestrator, synthesis, **paper agent** | 1× per question (agent mode: 1× per tool round + 1) |
 | `vlm` | `VLM_MODEL` → `CHAT_MODEL` | provider chat model | `figure_describer_sync` | 1× **per figure**, at ingestion |
 | `classifier` | `CLASSIFIER_MODEL` → `CHAT_MODEL` | provider chat model | `router.py`, `guardrail.py` | ≤ 2× per question |
 | `embedding` | `EMBEDDING_MODEL` | `*_EMBEDDING_MODEL` | ingestion + GLOBAL route | 1× per chunk, then 1× per GLOBAL query |
 | reading order | (chat role) | (chat role) | `reading_order.py` | on demand; long-context, slow |
 | section summary | (chat role) | (chat role) | `section_summarizer_sync` | multi-pass per document |
+
+## 3b. Per-note model override
+
+⚠ **The one place a call site does name a model.** A margin note may specify one, chosen by the
+reader from a picker; it is passed through `llm_client.chat/stream_chat(model=…)` and overrides
+the role mapping for that call only.
+
+The catalog ([`llm/catalog.py`](../../backend/app/llm/catalog.py)) reads Ollama's `/api/tags` and
+splits it:
+
+- **local** — real weights on disk, non-zero `size`.
+- **cloud** — run on Ollama's infrastructure, name ending in `cloud`, `size: 0`.
+
+Embedding models are filtered out; they share the tag list but cannot chat. When Ollama is
+unreachable the catalog degrades to the single configured cloud model.
+
+⚠ This does not break invariant 1. Nothing *hardcodes* a model — the name comes from the user at
+request time, and `requested_model` is persisted on the note so the answer stays attributable. A
+follow-up reuses its parent's model and cannot be overridden.
 
 **The classifier row is the performance lever.** Router and guardrail are cheap classification
 problems that a 1–3B model answers instantly. Left empty they inherit `CHAT_MODEL`, putting two

@@ -1,25 +1,142 @@
 # Chat & /ask
 
-> **What this is:** how a question becomes a grounded, cited answer — routing, retrieval, prompt
-> assembly, synthesis, persistence, compaction.
+> **What this is:** how a question becomes a grounded, cited answer.
 >
-> **Owns:** the four context routes, the guardrail, the research agent, citation hygiene.
+> **Owns:** the paper agent (`/notes`), the four context routes (`/ask`), the guardrail, the
+> research agent, citation hygiene.
 > **Does not own:** which model serves each call ([ai-backend.md](ai-backend.md)), where the
 > external results come from ([plans/exa-firecrawl-research-stack.md](../plans/exa-firecrawl-research-stack.md)).
 >
 > **Companions:** [overview.md](overview.md) — system context ·
-> [api.md](../03-reference/api.md) — the `/ask` request and response shapes ·
-> [database-schema.md](../03-reference/database-schema.md) — `conversation_turns`, `ask_traces`.
+> [api.md](../03-reference/api.md) — request and response shapes ·
+> [database-schema.md](../03-reference/database-schema.md) — `paper_notes`, `conversation_turns`.
 >
 > **Status:** current · **Last verified:** 2026-07-25 against
-> [`chat/orchestrator.py`](../../backend/app/chat/orchestrator.py)
-> **Verify with:** the `ASK[stepN]` log lines emitted on every question
+> [`chat/paper_agent.py`](../../backend/app/chat/paper_agent.py) and
+> [`chat/orchestrator.py`](../../backend/app/chat/orchestrator.py) (`main`, 9b75500)
+> **Verify with:** the `NOTE[...]` and `ASK[stepN]` log lines emitted on every question
 > **Volatile:** the EXTERNAL section — the provider is being replaced.
 
-The chat is the second half of the product. The reading view shows
-structural chunks one at a time. The `/ask` endpoint takes a user
-question, **decides what kind of context to retrieve**, builds that
-context, calls a local LLM, and returns a grounded answer with citations.
+## Two answering paths
+
+There are now two, and they share nothing but the LLM client.
+
+| | **Paper agent** (`/notes`) | **Orchestrator** (`/ask`) |
+| --- | --- | --- |
+| Serves | the article reader's margin notes | books, and any remaining `/ask` caller |
+| Source | [`chat/paper_agent.py`](../../backend/app/chat/paper_agent.py) | [`chat/orchestrator.py`](../../backend/app/chat/orchestrator.py) |
+| Retrieval | whole-document stuffing, or `SEARCH`/`READ` over chunks | LOCAL / GLOBAL / OVERVIEW / EXTERNAL |
+| Needs embeddings | ✗ | ✅ for GLOBAL |
+| Router | ✗ | ✅ |
+| Guardrail | ✗ | ✅ |
+| Compaction | ✗ | ✅ |
+| Persists to | `paper_notes` | `conversation_turns` + `ask_traces` |
+
+⚠ The paper agent deliberately drops routing, the guardrail, and compaction. A note is anchored to
+a place the reader is already looking at, so there is nothing to route; paper Q&A is in-scope by
+definition, so there is nothing to guard; and a note is one Q+A rather than a rolling transcript,
+so there is nothing to compact. Each omission removes a model call from the critical path.
+
+---
+
+# Part 1 — The paper agent (`/notes`)
+
+## Strategy is chosen by size
+
+```text
+                        note asked
+                             │
+                             ▼
+              SUM(chunks.token_count) for the paper
+                             │
+          ┌──────────────────┴──────────────────┐
+   <= WHOLE_PAPER_MAX_TOKENS          > WHOLE_PAPER_MAX_TOKENS
+          │                                     │
+          ▼                                     ▼
+    ── whole ──                          ── agent ──
+  every block in the prompt        outline + anchor in the prompt
+  one streamed call                        │
+          │                    ┌───────────┴───────────┐
+          │                    │  up to PAPER_AGENT_   │
+          │                    │  MAX_STEPS rounds     │
+          │                    │                       │
+          │                    │  model emits <tool>   │
+          │                    │   SEARCH: <terms>     │
+          │                    │   READ: <a>-<b>       │
+          │                    │  backend executes,    │
+          │                    │  feeds results back   │
+          │                    └───────────┬───────────┘
+          │                                ▼
+          │                    rounds spent → forced answer
+          └────────────────┬───────────────┘
+                           ▼
+              answer + [[42]] block markers
+                           ▼
+              cited_sequence_ids → jump chips
+```
+
+```mermaid
+%%{init: {'themeVariables': {'fontFamily': 'ui-monospace, SFMono-Regular, Menlo, monospace', 'lineColor': '#8b949e'}}}%%
+flowchart TD
+    N["note asked<br/>(anchor + question)"] --> SZ{"paper tokens<br/>&lt;= WHOLE_PAPER_MAX_TOKENS?"}
+    SZ -->|yes| W["whole:<br/>every block in the prompt"]
+    SZ -->|no| A["agent:<br/>outline + anchor only"]
+    A --> T{"model emits &lt;tool&gt;?"}
+    T -->|"SEARCH / READ"| X["execute against chunks<br/>feed observations back"]
+    X --> T
+    T -->|no, or rounds spent| ANS
+    W --> ANS["streamed answer<br/>with [[seq]] markers"]
+    ANS --> C["cited_sequence_ids<br/>→ jump chips"]
+
+    classDef owned stroke:#3b82f6,stroke-width:2px
+    class W,A,X,ANS owned
+```
+
+## The tools
+
+| Tool | Syntax | Backed by |
+| --- | --- | --- |
+| `SEARCH` | `SEARCH: reference sliding window attention` | Postgres full-text **plus** a literal `ILIKE` substring pass |
+| `READ` | `READ: 40-52` | `chunks` in that `sequence_id` range, capped in SQL |
+
+⚠ **The tools are a text protocol, not provider tool-calling.** This app fans out to Ollama and
+five OpenAI-compatible clouds whose tool-calling support and schemas differ; a fenced block every
+model can emit works on all of them, including local models with no tool support at all. The cost
+is a parser, and it is a deliberate trade. Tool calls are only recognised inside a `<tool>` block,
+so a model that writes "SEARCH:" in prose cannot trigger a round trip.
+
+⚠ **The substring leg is not redundant.** `to_tsvector` discards single Greek letters, equation
+numbers, and symbol subscripts entirely — a reader asking "why is τ so small here" gets zero
+full-text hits on the one term that matters.
+
+⚠ The two search legs run **sequentially, not gathered**. An `AsyncSession` is a single connection
+in a single greenlet context; concurrent statements on it are unsupported and fail under the wrong
+interleaving. Both legs are indexed lookups measured in single-digit milliseconds.
+
+## Citations
+
+The prompt asks the model to mark each grounded claim with its block number, `[[42]]`. Those are
+parsed into `cited_sequence_ids` and rendered as chips that scroll the article.
+
+⚠ The parser matches a whole bracket blob, not a single number. Models routinely group references
+as `[[16], [42]]` or `[[16, 42]]`; a strict `\[\[(\d+)\]\]` silently returns nothing for those,
+and the note renders with no chips — making a well-grounded answer look ungrounded.
+
+## Model selection
+
+A note records both `requested_model` (what the reader picked) and `model` (what the provider
+reported). The catalog comes from [`llm/catalog.py`](../../backend/app/llm/catalog.py).
+
+⚠ **A follow-up always uses its parent's `requested_model`, and the client cannot override it.**
+A thread that switched models halfway would destroy the comparison the picker exists for — you
+would no longer know which model said what.
+
+---
+
+# Part 2 — The orchestrator (`/ask`)
+
+⚠ `[historical]` for papers. The article reader never calls `/ask`; this path now serves books and
+any external caller. The routes below are unchanged.
 
 ## The four context modes
 

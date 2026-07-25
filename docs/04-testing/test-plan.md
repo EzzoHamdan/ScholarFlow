@@ -8,7 +8,7 @@
 > ([operations.md](../01-orientation/operations.md)).
 >
 > **Status:** current · **Last verified:** 2026-07-25
-> **Verify with:** `cd backend && pytest -v`
+> **Verify with:** `cd backend && POSTGRES_DB=9xaipal_test pytest -v`
 
 ---
 
@@ -16,28 +16,45 @@
 
 ```bash
 cd backend && source .venv/bin/activate
-pytest -v
+POSTGRES_DB=9xaipal_test pytest -v
 ```
 
 | File | Covers |
 | --- | --- |
 | [`test_chunk_sequence.py`](../../backend/tests/test_chunk_sequence.py) | Chunker sequence numbering + structural type detection |
-| [`test_ingestion_pipeline.py`](../../backend/tests/test_ingestion_pipeline.py) | End-to-end pipeline (extractor stub → chunks → assets) |
+| [`test_ingestion_pipeline.py`](../../backend/tests/test_ingestion_pipeline.py) | End-to-end pipeline (extractor stub → chunks → assets); the fast/full profile split — a paper completes at chunking with nothing dispatched, a book still dispatches `embed_document` |
 | [`test_vector_retrieval.py`](../../backend/tests/test_vector_retrieval.py) | `search_chunks` against pgvector with deterministic vectors |
 | [`test_provider_resolver.py`](../../backend/tests/test_provider_resolver.py) | Provider auto-detection, fallback order, namespace isolation, `NoLLMConfigured` |
 | [`test_subthread_conversations.py`](../../backend/tests/test_subthread_conversations.py) | Sub-thread trees via `parent_turn_id`, recursive history |
 | [`test_context_router.py`](../../backend/tests/test_context_router.py) | ⚠ **Placeholder — a single comment line. Covers nothing.** |
 
-⚠ **These tests require a live Postgres and will `TRUNCATE documents CASCADE` against whatever
-`POSTGRES_DB` resolves to.** `conftest.py` truncates before and after every test. Point the env at
-a throwaway database before running, or you will lose your library.
+⚠ **These tests `TRUNCATE documents CASCADE` against whatever `POSTGRES_DB` resolves to**, before
+and after every test. That cascade takes chunks, assets, conversations, and notes with it — run it
+against the development database and the library is gone, with only the PDFs left on disk. This
+has happened.
+
+`conftest.py` therefore refuses to start unless the database name contains "test":
 
 ```bash
-POSTGRES_DB=9xaipal_test pytest -v
+POSTGRES_DB=9xaipal_test pytest -v          # the normal way
+ALLOW_DESTRUCTIVE_TESTS=1 pytest -v         # override, if you mean it
 ```
 
-**Not covered by anything:** `chat/orchestrator.py`, `extraction/chunker.py`, the API layer, and
-the entire frontend. See [roadmap.md](../roadmap.md).
+First-time setup of the scratch database:
+
+```bash
+docker exec 9xaipal-postgres psql -U 9xaipal -d postgres -c 'CREATE DATABASE "9xaipal_test"'
+docker exec 9xaipal-postgres psql -U 9xaipal -d 9xaipal_test \
+  -c 'CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'
+```
+
+**Not covered by anything:** `chat/orchestrator.py`, `chat/paper_agent.py`, `extraction/chunker.py`,
+`extraction/glyph_repair.py`, the notes API, and the entire frontend. See
+[roadmap.md](../roadmap.md).
+
+⚠ `test_chunk_sequence.py::test_embedding_batching_resumption_and_casting` fails on a default
+setup: it builds 4096-dimension vectors while the column is `vector(1024)` per `VECTOR_DIMENSION`.
+Pre-existing, unrelated to ingestion correctness.
 
 ---
 

@@ -90,7 +90,10 @@ The application code is more mature than the tooling around it. These are the ch
 
 - **Two files over 1000 lines**: `chat/orchestrator.py` and `extraction/chunker.py`. Splitting the
   orchestrator's four context strategies into a dispatch table would help most.
-- **`ReadingView.tsx` is 1311 lines** — the largest frontend file by 240 %.
+- **`BookReadingView.tsx` is ~1320 lines** — the old reveal reader, now reached only for
+  `doc_kind='book'`. Untouched by the article-reader work and still the largest frontend file.
+- **`ChatPane.tsx` is reachable only from the book reader.** Papers never mount it. If books are
+  ever retired, it and the four `/ask` context strategies go with them.
 - **Two pipelines exist**: `extraction/pipeline.py` (async, legacy) and `pipeline_sync.py` (used by
   Celery). `[historical]` The async in-process `BackgroundTasks` + `asyncio.Queue` design was
   replaced by Celery; the async pipeline survives as a fast path. One of them should go.
@@ -103,8 +106,10 @@ The application code is more mature than the tooling around it. These are the ch
 - `[planned]` **Replace SearXNG with Exa + Firecrawl** — semantic search plus real page reading,
   so the research agent stops synthesizing from 280-character snippets. Full design:
   [plans/exa-firecrawl-research-stack.md](plans/exa-firecrawl-research-stack.md).
-- `[planned]` **Paper-only mode** — skip the embedding pass for documents that fit whole in the
-  model's context, serving GLOBAL from full-text search + document stuffing. Design:
+- ~~**Paper-only mode**~~ — **superseded 2026-07-25** by `INGEST_PROFILE=fast`, which skips the
+  whole post-chunking chain for papers rather than embeddings alone, and answers at question time
+  via [`chat/paper_agent.py`](../backend/app/chat/paper_agent.py). The `PAPER_ONLY_*` settings
+  still govern `INGEST_PROFILE=full` and books. Original design:
   [plans/paper-only-embedding-skip.md](plans/paper-only-embedding-skip.md).
 - `[planned]` **Alembic** for schema evolution, replacing best-effort `schema.sql` application.
 - `[planned]` Cross-paper GLOBAL search across the whole library.

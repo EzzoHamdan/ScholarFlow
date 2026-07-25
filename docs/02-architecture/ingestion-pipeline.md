@@ -2,7 +2,8 @@
 
 > **What this is:** the path a PDF takes from upload to readable, chunk by chunk.
 >
-> **Owns:** extraction, chunking, asset handling, embedding, and summarization order.
+> **Owns:** extraction, chunking, glyph repair, asset handling, embedding, and summarization
+> order — and which of those actually run.
 > **Does not own:** how chunks are retrieved at question time ([chat-and-ask.md](chat-and-ask.md)),
 > where files land on disk ([storage.md](../03-reference/storage.md)).
 >
@@ -12,11 +13,34 @@
 >
 > **Status:** current · **Last verified:** 2026-07-25 against
 > [`extraction/pipeline_sync.py`](../../backend/app/extraction/pipeline_sync.py) and
-> [`workers/tasks.py`](../../backend/app/workers/tasks.py)
+> [`workers/tasks.py`](../../backend/app/workers/tasks.py) (`main`, 9b75500)
 > **Verify with:** `pytest tests/test_ingestion_pipeline.py -v`
 
-This is the path a PDF takes from "the user dragged it onto the library"
-to "I can read it chunk-by-chunk and ask grounded questions about it."
+This is the path a PDF takes from "the user dragged it onto the library" to "I can read it and
+ask grounded questions about it."
+
+## The profile decides how much of this runs
+
+`INGEST_PROFILE` (default `fast`) and `doc_kind` together pick one of two chains:
+
+| | `fast` + `doc_kind='paper'` | `full`, or any book |
+| --- | --- | --- |
+| Extraction + chunking | ✅ | ✅ |
+| Glyph repair | ✅ | ✅ |
+| Assets linked | ✅ | ✅ |
+| Embeddings | ✗ | ✅ (unless paper-only skips them) |
+| Section summaries | ✗ | ✅ |
+| VLM figure descriptions | ✗ | ✅ |
+| Complete after | **chunking** | `generate_section_summaries` |
+
+Under `fast` a paper is readable the moment MinerU and the chunker finish — nothing stands between
+dropping a PDF and reading it. Everything the model needs is derived at question time by
+[`chat/paper_agent.py`](../../backend/app/chat/paper_agent.py); see
+[chat-and-ask.md](chat-and-ask.md).
+
+⚠ Books never take the fast path. A book cannot be stuffed into a context window, and full-text
+scanning a 700-page volume is not a substitute for vector retrieval, so it still needs the full
+chain to be answerable.
 
 ## End-to-end timeline
 
@@ -48,42 +72,109 @@ poll /papers/{id}/progress every 1s
                                                     INSERT chunks (one row per chunk)
                                                       │
                                                       ▼
+                                                    repair_chunks(): undo MinerU's U+FFFD
+                                                      │
+                                                      ▼
                                                     move images to images/<doc_id>/
                                                     INSERT chunk_assets (link via markdown ref)
                                                       │
                                                       ▼
-                                                    _should_skip_embeddings()
-                                                    UPDATE documents → embedding_mode
-                                                      │
-                                          ┌───────────┴───────────┐
-                                     embedded                 skipped
-                                          │                       │
-                                  job → 'embedding'       job → 'summarizing'
-                                  embed_document.delay()          │
-                                          │                       │
-                                    UPDATE documents → 'processing', page_count
-   │                                      │                       │
-   ▼                                      ▼                       │
-poll continues                   embed_document_chunks_sync()     │
-                                   → batches of 20 chunks         │
-                                   → INSERT chunk_embeddings      │
-                                          │                       │
-                                          └───────────┬───────────┘
-                                                      ▼
-                                          generate_section_summaries
-                                            → hierarchical summaries → section_summaries
-                                            → VLM figure descriptions → figure_descriptions
-                                            → _mark_document_and_job_complete()
-   │                                                  │
-   ▼                                                  ▼
-status == 'complete'  ◄───────────────────────  documents + job → 'complete'
+                                                    _is_fast_ingest()?
+                                          ┌───────────┴────────────┐
+                                        yes                        no
+                                (paper, INGEST_PROFILE=fast)       │
+                                          │                        ▼
+                                          │              _should_skip_embeddings()
+                                          │              UPDATE documents → embedding_mode
+                                          │                        │
+                                          │            ┌───────────┴───────────┐
+                                          │       embedded                 skipped
+                                          │            │                       │
+                                          │    job → 'embedding'       job → 'summarizing'
+                                          │    embed_document.delay()          │
+                                          │            │                       │
+                                          │      UPDATE documents → 'processing', page_count
+   │                                      │            │                       │
+   ▼                                      │            ▼                       │
+poll continues                            │   embed_document_chunks_sync()     │
+                                          │     → batches of 20 chunks         │
+                                          │     → INSERT chunk_embeddings      │
+                                          │            │                       │
+                                          │            └───────────┬───────────┘
+                                          │                        ▼
+                                          │            generate_section_summaries
+                                          │              → section_summaries
+                                          │              → figure_descriptions
+                                          │              → _mark_document_and_job_complete()
+                                          │                        │
+                              embedding_mode='skipped'             │
+                              (reason: fast_ingest)                │
+                              documents + job → 'complete'         │
+                              dispatch NOTHING                     │
+   │                                      │                        │
+   ▼                                      ▼                        ▼
+status == 'complete'  ◄──────────────────────────────────────────────
    │
    ▼
-switch to ReadingView
+open the paper in ArticleReader
 ```
 
-⚠ `status='complete'` is set **once, at the very end**, by `generate_section_summaries` — not when
-embeddings are dispatched. Both the embedded and skipped branches converge there.
+### (rendered)
+
+```mermaid
+%%{init: {'themeVariables': {'fontFamily': 'ui-monospace, SFMono-Regular, Menlo, monospace', 'lineColor': '#8b949e'}}}%%
+flowchart TD
+    UP["POST /papers/upload"] --> EX["extracting<br/>MinerU → md + images"]
+    EX --> CH["chunking<br/>content_list.json → chunks"]
+    CH --> GR["repair_chunks<br/>U+FFFD → LaTeX"]
+    GR --> AS["move images<br/>INSERT chunk_assets"]
+    AS --> Q{"_is_fast_ingest()<br/>paper + INGEST_PROFILE=fast?"}
+    Q -->|yes| DONE1["embedding_mode='skipped'<br/>documents + job → complete<br/>⚠ dispatch nothing"]
+    Q -->|no| SK{"_should_skip_embeddings()"}
+    SK -->|embed| EMB["embed_document<br/>→ chunk_embeddings"]
+    SK -->|skip| SUM
+    EMB --> SUM["generate_section_summaries<br/>+ figure_descriptions"]
+    SUM --> DONE2["_mark_document_and_job_complete()"]
+    DONE1 --> READ(["readable"])
+    DONE2 --> READ
+
+    classDef fast stroke:#10b981,stroke-width:2px
+    classDef slow stroke:#f59e0b,stroke-width:2px
+    class DONE1 fast
+    class EMB,SUM,DONE2 slow
+```
+
+⚠ **Completion is set in exactly two places**, and they are mutually exclusive:
+`generate_section_summaries` at the end of the full chain, and `run_pipeline_sync` on the fast
+path. The fast path may set it only because it dispatches nothing afterwards — there is no
+downstream task left to contradict it. Adding a dispatch to that branch without moving the
+completion would reintroduce the bug where the UI reported "done" while a worker was still
+running.
+
+## Step 1.5 — Glyph repair
+
+MinerU writes **U+FFFD REPLACEMENT CHARACTER** wherever a paper typesets an inline variable using
+the Unicode Mathematical Alphanumeric Symbols block (U+1D400–U+1D7FF). Those codepoints are astral
+— above U+FFFF — and its text pipeline mangles the surrogate pairs. The reader then shows `�`
+where a variable should be:
+
+```text
+MinerU:  "limiting output attention to the preceding � tokens (� defaults to 128)"
+Truth:   "limiting output attention to the preceding 𝑛 tokens (𝑛 defaults to 128)"
+                                                     ^ U+1D45B
+```
+
+U+FFFD carries no information — you cannot tell *n* from *t* by looking at it. But the PDF still
+does, and PyMuPDF decodes the same glyphs correctly, so
+[`glyph_repair.py`](../../backend/app/extraction/glyph_repair.py) re-reads the source page and uses
+the surrounding text as a lookup key. The recovered character is emitted as LaTeX (`𝑛` → `$n$`)
+so it renders as italic math and the model sees a variable rather than an exotic codepoint.
+
+⚠ Best-effort by design. An ambiguous match is left as `�` — a visible mystery glyph beats a
+confidently wrong letter in a formula. Measured on the reference paper: 14 of 14 recovered.
+
+Runs in the pipeline and again on `/rechunk`, so a paper already on disk can be repaired without
+re-running MinerU.
 
 ## Step 1 — Upload
 
@@ -162,13 +253,24 @@ matching downstream task.
      `generate_section_summaries.delay(document_id)` — the chain is re-attached here.
 4. `UPDATE documents SET status='processing', page_count=<pypdf count>`.
 
-⚠ **The pipeline does NOT mark the document complete.** Completion is set only by
+⚠ **On the full chain the pipeline does NOT mark the document complete.** Completion is set by
 `_mark_document_and_job_complete` at the end of `generate_section_summaries`
-([`workers/tasks.py`](../../backend/app/workers/tasks.py)) — the single normal exit from the whole
-pipeline. Marking it complete here was the bug that made the UI report "done" while the worker was
-still embedding and describing figures.
+([`workers/tasks.py`](../../backend/app/workers/tasks.py)) — the normal exit whenever anything is
+dispatched. Marking it complete before that was the bug that made the UI report "done" while the
+worker was still embedding and describing figures.
+
+The fast path is the one exception, and only because it dispatches nothing: it sets
+`embedding_mode='skipped'` (reason `fast_ingest`), records `page_count`, marks the document and
+job complete, and returns. Verified by
+`tests/test_ingestion_pipeline.py::test_run_pipeline_success` (nothing dispatched, status
+complete) and `::test_run_pipeline_book_still_runs_full_chain` (book still dispatches
+`embed_document` and stays at `processing`).
 
 ### Paper-only mode: conditional dispatch
+
+⚠ `[historical]` for papers under the default profile — the fast path returns before
+`_should_skip_embeddings` is ever reached. This section still describes `INGEST_PROFILE=full` and
+every book.
 
 ```text
                      chunks persisted
@@ -244,7 +346,13 @@ when they are skipped. `generate_section_summaries`:
 3. Results stored in `section_summaries` and `figure_descriptions` tables.
 
 This step is slow (minutes per paper) but doesn't block the user — they
-can start reading and asking questions as soon as `status='complete'`.
+can start reading and asking questions as soon as `status='complete'` — which, under the default
+fast profile, is as soon as chunking finishes.
+
+⚠ The upload overlay shows a **different step list per `doc_kind`**: two steps for a paper
+(extract, chunk), four for a book (plus embed, summarize). Showing a paper an "Embedding" step it
+never runs would tick green having done nothing — see
+[`ProcessingOverlay.tsx`](../../frontend/src/views/ProcessingOverlay.tsx).
 
 ## Status taxonomy
 
@@ -255,7 +363,7 @@ can start reading and asking questions as soon as `status='complete'`.
 | `chunking`                    | `queued`     | overlay: chunking |
 | `embedding`                   | `queued`     | overlay: embedding · skipped entirely in paper-only mode |
 | `summarizing`                 | `complete`   | overlay closes    |
-| `complete`                    | `complete`   | flip to ReadingView |
+| `complete`                    | `complete`   | flip to the reader |
 | `failed`                      | `failed`     | back to LibraryView |
 
 ## Deletion

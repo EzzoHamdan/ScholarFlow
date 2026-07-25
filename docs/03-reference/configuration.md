@@ -8,7 +8,7 @@
 > how to bring the stack up ([setup.md](../01-orientation/setup.md)).
 >
 > **Status:** current · **Last verified:** 2026-07-25 against
-> [`app/core/config.py`](../../backend/app/core/config.py)
+> [`app/core/config.py`](../../backend/app/core/config.py) (`main`, 9b75500)
 > **Verify with:** `python -c "from app.core.config import settings; print(settings.model_dump())"`
 > **Volatile:** the whole file mirrors `config.py` — re-verify on any change to that file.
 
@@ -99,7 +99,42 @@ cloud API — each cloud provider has its own `*_CHAT_MODEL` above.
 | `MINERU_PAGE_BATCH_SIZE` | `100` | Compose-only. Extract in page-range batches so peak RAM stays bounded on long books. `0` disables. |
 | `MAX_UPLOAD_SIZE_MB` | `100` | Hard cap on the upload body. |
 
+## Ingest profile
+
+Which pipeline a document takes after chunking. Detail:
+[ingestion-pipeline.md](../02-architecture/ingestion-pipeline.md).
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `INGEST_PROFILE` | `fast` | `fast` = a paper is complete once MinerU and the chunker have run: no embeddings, no section summaries, no VLM figure descriptions. `full` = the historical chain, still honouring `PAPER_ONLY_MODE` below. |
+| `VLM_MAX_CONCURRENCY` | `4` | Figure descriptions generated in parallel (`full` profile only). The calls are network I/O, so a small pool turns wall-clock from the sum of every figure into roughly the slowest one. `1` restores sequential. ⚠ Concurrent load on one inference endpoint — a hosted one may rate-limit. |
+
+⚠ The profile applies **only to `doc_kind='paper'`**. A book always takes the full chain: it can
+neither be stuffed into a context window nor usefully full-text scanned, so it still needs vectors
+to be answerable.
+
+⚠ Under `fast`, `documents.embedding_mode` is recorded as `'skipped'` with reason `fast_ingest`,
+and the document reaches `status='complete'` inside `run_pipeline_sync` rather than at the end of
+the Celery chain. That is the one other place completion is set, and it is safe precisely because
+the fast path dispatches nothing afterwards
+([`pipeline_sync.py`](../../backend/app/extraction/pipeline_sync.py)).
+
+## Paper agent
+
+How a question is answered when there are no embeddings. Detail:
+[chat-and-ask.md](../02-architecture/chat-and-ask.md).
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `WHOLE_PAPER_MAX_TOKENS` | `120000` | Stuff the entire document into the prompt when `SUM(chunks.token_count)` is at or below this. Above it, the agent falls back to an iterative `SEARCH`/`READ` loop. ⚠ `token_count` is a `len/4` heuristic that undercounts math and tables — leave headroom below the model's real window. |
+| `PAPER_AGENT_MAX_STEPS` | `4` | Tool rounds before the model is forced to answer with what it has. |
+| `PAPER_AGENT_READ_MAX_CHUNKS` | `40` | Ceiling on one `READ` range, so a greedy request cannot blow the context window. Enforced in SQL. |
+| `PAPER_AGENT_SEARCH_LIMIT` | `8` | Ceiling on hits returned by one `SEARCH`. |
+
 ## Paper-only mode
+
+⚠ `[historical]` for papers — superseded by `INGEST_PROFILE=fast`, which skips more than just
+embeddings. These keys still govern the `full` profile and books.
 
 Skip the embedding pass for documents that fit whole in the chat model's context. Design and
 rationale: [paper-only-embedding-skip.md](../plans/paper-only-embedding-skip.md).
@@ -121,7 +156,7 @@ in the entire existing library. The gate is measured token count.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `LOCAL_CONTEXT_WINDOW` | `3` | Chunks on each side of the current one for the LOCAL route. |
+| `LOCAL_CONTEXT_WINDOW` | `3` | Chunks on each side of the anchor. Used by the LOCAL route **and** by the paper agent for the window around a note's anchor. |
 | `GUARDRAIL_SKIP_IN_PAPER` | `true` | Skip the topic guardrail while reading a paper — paper Q&A is in-scope by definition, so this removes a model call per question. |
 | `CHAT_NUM_PREDICT` | `0` | Cap on answer length. `0` = uncapped. |
 | `MAX_CONCURRENT_ASKS` | `3` | Concurrent `/ask` per uvicorn worker; protects Ollama from OOM. |
