@@ -3,7 +3,25 @@ import { IconBack, IconDoc } from '../components/Icons';
 import { ArticleBlock } from './ArticleBlock';
 import { AskComposer, type ComposerTarget } from './AskComposer';
 import { NoteCardView, PendingNoteCard, type NoteGroup, type PendingNote } from './NoteCard';
-import { captureSelection, clearAnchors, paintAnchors } from '../lib/highlight';
+import {
+  PersonalNoteCard,
+  PersonalNoteComposer,
+  type PersonalComposerTarget,
+} from './PersonalNoteCard';
+import {
+  captureSelection,
+  clearAnchors,
+  paintAnchors,
+} from '../lib/highlight';
+import {
+  clearBookmark,
+  loadBookmark,
+  loadPersonalNotes,
+  saveBookmark,
+  savePersonalNotes,
+  type PersonalBookmark,
+  type PersonalNote,
+} from '../lib/personalNotes';
 import { createPacer } from '../lib/pacer';
 import {
   askNoteStream,
@@ -51,6 +69,25 @@ function layoutFor(width: number): Layout {
   return 'inline';
 }
 
+/**
+ * Short, human-friendly "saved X ago" for the Resume chip. The threshold
+ * ladder is loose because nobody needs "saved 47 seconds ago" — the chip is
+ * small and the user wants to know whether to trust the bookmark.
+ */
+function formatRelativeTime(updatedAt: number, now: number = Date.now()): string {
+  const ms = now - updatedAt;
+  if (ms < 0 || ms < 60_000) return 'just now';
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d ago`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(mo / 12)}y ago`;
+}
+
 let clientIdSeq = 0;
 
 interface Props {
@@ -65,12 +102,17 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
   const [notes, setNotes] = useState<PaperNote[]>([]);
   const [pending, setPending] = useState<PendingNote[]>([]);
   const [composer, setComposer] = useState<ComposerTarget | null>(null);
+  const [personalComposer, setPersonalComposer] = useState<PersonalComposerTarget | null>(null);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [tintedBlocks, setTintedBlocks] = useState<Set<number>>(new Set());
   const [progress, setProgress] = useState(0);
   const [outlineOpen, setOutlineOpen] = useState(false);
   const [layout, setLayout] = useState<Layout>(() => layoutFor(window.innerWidth));
   const wideEnough = layout !== 'inline';
+
+  // User-owned state persisted in localStorage.
+  const [personalNotes, setPersonalNotes] = useState<PersonalNote[]>([]);
+  const [bookmark, setBookmark] = useState<PersonalBookmark | null>(null);
 
   // Model choice. Remembered across sessions so the reader does not re-pick it
   // on every question, but re-validated against the catalog on load — a model
@@ -133,6 +175,17 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     return () => clearInterval(id);
   }, [doc, paperId]);
 
+  // Load personal notes and bookmark for this paper.
+  useEffect(() => {
+    setPersonalNotes(loadPersonalNotes(paperId));
+    setBookmark(loadBookmark(paperId));
+  }, [paperId]);
+
+  // Persist personal notes whenever they change.
+  useEffect(() => {
+    savePersonalNotes(paperId, personalNotes);
+  }, [paperId, personalNotes]);
+
   useEffect(() => {
     let alive = true;
     listModels()
@@ -187,18 +240,25 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
   // ── Paint the quote highlights inside the article ───────────────────────
   useEffect(() => {
     if (!doc) return;
-    const anchors = groups.map((g) => ({
-      noteId: g.root.id,
-      sequenceId: g.root.anchor_sequence_id,
-      quote: g.root.anchor_quote,
-    }));
+    const anchors = [
+      ...groups.map((g) => ({
+        noteId: g.root.id,
+        sequenceId: g.root.anchor_sequence_id,
+        quote: g.root.anchor_quote,
+      })),
+      ...personalNotes.map((pn) => ({
+        noteId: pn.id,
+        sequenceId: pn.anchorSequenceId,
+        quote: pn.quote,
+      })),
+    ];
     // The article has to be laid out before ranges can be found in it.
     const raf = requestAnimationFrame(() => {
       const unmatched = paintAnchors(blockFor, anchors, activeNoteId);
       setTintedBlocks(new Set(unmatched));
     });
     return () => cancelAnimationFrame(raf);
-  }, [doc, groups, activeNoteId, blockFor]);
+  }, [doc, groups, personalNotes, activeNoteId, blockFor]);
 
   /** Which margin a card belongs in, honouring what the layout can show. */
   const sideOf = useCallback(
@@ -242,6 +302,18 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         seq: composer.sequenceId,
       });
     }
+    if (personalComposer) {
+      bySide[sideOf(personalComposer.marginSide)].push({
+        key: 'personal-composer',
+        seq: personalComposer.sequenceId,
+      });
+    }
+    for (const pn of personalNotes) {
+      bySide[sideOf(pn.marginSide)].push({
+        key: pn.id,
+        seq: pn.anchorSequenceId,
+      });
+    }
 
     for (const side of ['left', 'right'] as MarginSide[]) {
       const entries = bySide[side].sort((a, b) => a.seq - b.seq);
@@ -256,7 +328,7 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         cursor = top + el.offsetHeight + NOTE_GAP;
       }
     }
-  }, [groups, pending, composer, wideEnough, sideOf]);
+  }, [groups, pending, composer, personalComposer, personalNotes, wideEnough, sideOf]);
 
   /**
    * Coalesced re-layout.
@@ -299,16 +371,113 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       ro.disconnect();
       window.removeEventListener('resize', requestLayout);
     };
-  }, [requestLayout, wideEnough, groups.length, pending.length, composer]);
+  }, [requestLayout, wideEnough, groups.length, pending.length, composer, personalNotes.length, personalComposer]);
 
   // ── Reading progress ────────────────────────────────────────────────────
+  //
+  // We also recompute which block is currently the topmost in the viewport on
+  // every scroll — needed for the Resume chip to know whether it should appear
+  // as a navigation target or as a "you are here" indicator.
+  const [atBookmark, setAtBookmark] = useState(false);
+  const recomputeAtBookmark = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || !doc) return;
+    const viewportTop = el.getBoundingClientRect().top + 8; // tolerate tiny offsets
+    let bestSeq = doc.blocks[0]?.sequence_order ?? 0;
+    let bestDelta = Infinity;
+    for (const block of doc.blocks) {
+      const bel = blockRefs.current.get(block.sequence_order);
+      if (!bel) continue;
+      const delta = Math.abs(bel.getBoundingClientRect().top - viewportTop);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestSeq = block.sequence_order;
+      }
+    }
+    setAtBookmark(bestSeq === bookmark?.sequenceId);
+  }, [doc, bookmark?.sequenceId]);
+
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     const max = el.scrollHeight - el.clientHeight;
     setProgress(max > 0 ? Math.min(1, el.scrollTop / max) : 0);
     setPill(null);
-  }, []);
+    recomputeAtBookmark();
+  }, [recomputeAtBookmark]);
+
+  // ── Bookmark ────────────────────────────────────────────────────────────
+  // Build the human-readable preview shown on the Resume chip. A figure has no
+  // prose, an equation has math, etc. — so the snippet is a label rather than
+  // text in those cases. We also include a leading "¶N · " when there is no
+  // natural label so the chip always shows what the bookmark points at.
+  const snippetForBlock = (block: DocBlock, seq: number): string => {
+    const ref = `¶${seq}`;
+    const t = block.structural_type;
+    if (t === 'figure') return `${ref} · figure`;
+    if (t === 'math') return `${ref} · equation`;
+    const text = (block.plain_text || block.content_markdown || '').replace(/\s+/g, ' ').trim();
+    if (!text) return ref;
+    return `${ref} · “${text.length > 60 ? text.slice(0, 60).trimEnd() + '…' : text}”`;
+  };
+
+  const kindForBlock = (block: DocBlock): PersonalBookmark['kind'] => {
+    const t = block.structural_type;
+    if (t === 'figure') return 'figure';
+    if (t === 'math') return 'equation';
+    if (t === 'heading' || t === 'paragraph' || t === 'text') return 'text';
+    return 'block';
+  };
+
+  const saveBookmarkNow = useCallback(() => {
+    if (!doc || !scrollRef.current) return;
+    const scroller = scrollRef.current;
+    const viewportTop = scroller.getBoundingClientRect().top;
+    // Anchor to the block whose top is closest to the top of the viewport.
+    let bestSeq = doc.blocks[0]?.sequence_order ?? 0;
+    let bestBlock: DocBlock | null = doc.blocks[0] ?? null;
+    let bestDelta = Infinity;
+    for (const block of doc.blocks) {
+      const el = blockRefs.current.get(block.sequence_order);
+      if (!el) continue;
+      const delta = Math.abs(el.getBoundingClientRect().top - viewportTop);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestSeq = block.sequence_order;
+        bestBlock = block;
+      }
+    }
+    const b: PersonalBookmark = {
+      sequenceId: bestSeq,
+      progress,
+      updatedAt: Date.now(),
+      snippet: bestBlock ? snippetForBlock(bestBlock, bestSeq) : `¶${bestSeq}`,
+      kind: bestBlock ? kindForBlock(bestBlock) : 'block',
+      page: bestBlock?.page_start ?? null,
+    };
+    saveBookmark(paperId, b);
+    setBookmark(b);
+  }, [doc, paperId, progress]);
+
+  const removeBookmark = useCallback(() => {
+    clearBookmark(paperId);
+    setBookmark(null);
+  }, [paperId]);
+
+  // jumpTo is declared later in this component, so bookmark navigation reads
+  // it through a ref that is updated once jumpTo exists.
+  const jumpToRef = useRef<(seq: number) => void>(() => {});
+
+  const jumpToBookmark = useCallback(() => {
+    if (!bookmark) return;
+    jumpToRef.current(bookmark.sequenceId);
+  }, [bookmark]);
+
+  // After the doc paints, the block tops are finally measurable. Re-evaluate
+  // "are we at the bookmark" once layout is in.
+  useLayoutEffect(() => {
+    recomputeAtBookmark();
+  }, [doc, bookmark, recomputeAtBookmark]);
 
   // ── Selection → the "Ask" pill ──────────────────────────────────────────
   useEffect(() => {
@@ -369,6 +538,43 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     window.getSelection()?.removeAllRanges();
   }, [suggestSide]);
 
+  const openPersonalComposerFromSelection = useCallback(() => {
+    const article = articleRef.current;
+    if (!article) return;
+    const cap = captureSelection(article);
+    setPill(null);
+    if (!cap) return;
+    setPersonalComposer({
+      sequenceId: cap.sequenceId,
+      chunkId: cap.chunkId,
+      kind: 'text',
+      quote: cap.quote,
+      imageUrl: null,
+      marginSide: suggestSide(cap.sequenceId),
+    });
+    window.getSelection()?.removeAllRanges();
+  }, [suggestSide]);
+
+  const saveBookmarkFromSelection = useCallback(() => {
+    const article = articleRef.current;
+    if (!article) return;
+    const cap = captureSelection(article);
+    setPill(null);
+    if (!cap) return;
+    const block = doc?.blocks.find((b) => b.sequence_order === cap.sequenceId) ?? null;
+    const b: PersonalBookmark = {
+      sequenceId: cap.sequenceId,
+      progress,
+      updatedAt: Date.now(),
+      snippet: block ? snippetForBlock(block, cap.sequenceId) : `¶${cap.sequenceId}`,
+      kind: block ? kindForBlock(block) : 'block',
+      page: block?.page_start ?? null,
+    };
+    saveBookmark(paperId, b);
+    setBookmark(b);
+    window.getSelection()?.removeAllRanges();
+  }, [doc, paperId, progress]);
+
   const openComposerForBlock = useCallback(
     (block: DocBlock, kind: 'figure' | 'equation') => {
       setComposer({
@@ -412,6 +618,30 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     });
   }, [doc, suggestSide]);
 
+  const openPersonalComposerAtViewport = useCallback(() => {
+    const scroller = scrollRef.current;
+    if (!scroller || !doc) return;
+    const top = scroller.getBoundingClientRect().top + 80;
+    let best: { seq: number; id: string; delta: number } | null = null;
+    for (const block of doc.blocks) {
+      const el = blockRefs.current.get(block.sequence_order);
+      if (!el) continue;
+      const delta = Math.abs(el.getBoundingClientRect().top - top);
+      if (!best || delta < best.delta) {
+        best = { seq: block.sequence_order, id: block.id, delta };
+      }
+    }
+    if (!best) return;
+    setPersonalComposer({
+      sequenceId: best.seq,
+      chunkId: best.id,
+      kind: 'block',
+      quote: null,
+      imageUrl: null,
+      marginSide: suggestSide(best.seq),
+    });
+  }, [doc, suggestSide]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -428,14 +658,37 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         if (cap) openComposerFromSelection();
         else openComposerAtViewport();
       }
+      if (e.key === 'n' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const cap = articleRef.current ? captureSelection(articleRef.current) : null;
+        if (cap) openPersonalComposerFromSelection();
+        else openPersonalComposerAtViewport();
+      }
+      if (e.key === 'b' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        // Bookmark reuses the same "topmost block" rule as the bar's button.
+        // Selection wins if there is one — a bookmark over a passage is a more
+        // specific intent than "wherever I'm looking."
+        e.preventDefault();
+        const cap = articleRef.current ? captureSelection(articleRef.current) : null;
+        if (cap) saveBookmarkFromSelection();
+        else saveBookmarkNow();
+      }
       if (e.key === 'Escape') {
         setComposer(null);
+        setPersonalComposer(null);
         setPill(null);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [openComposerFromSelection, openComposerAtViewport]);
+  }, [
+    openComposerFromSelection,
+    openComposerAtViewport,
+    openPersonalComposerFromSelection,
+    openPersonalComposerAtViewport,
+    saveBookmarkFromSelection,
+    saveBookmarkNow,
+  ]);
 
   // ── Asking ──────────────────────────────────────────────────────────────
   const runNote = useCallback(
@@ -489,6 +742,49 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       }
     },
     [paperId],
+  );
+
+  const submitPersonalNote = useCallback(
+    (body: string) => {
+      if (!personalComposer) return;
+      const now = Date.now();
+      const note: PersonalNote = {
+        id: `${now}-${Math.random().toString(36).slice(2, 10)}`,
+        anchorSequenceId: personalComposer.sequenceId,
+        anchorChunkId: personalComposer.chunkId,
+        quote: personalComposer.quote,
+        body,
+        marginSide: personalComposer.marginSide,
+        createdAt: now,
+        updatedAt: now,
+      };
+      setPersonalNotes((prev) => [...prev, note]);
+      setPersonalComposer(null);
+    },
+    [personalComposer],
+  );
+
+  const updatePersonalNote = useCallback((id: string, body: string) => {
+    setPersonalNotes((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, body, updatedAt: Date.now() } : n)),
+    );
+  }, []);
+
+  const removePersonalNote = useCallback((id: string) => {
+    setPersonalNotes((prev) => prev.filter((n) => n.id !== id));
+  }, []);
+
+  const flipPersonalNote = useCallback(
+    (id: string) => {
+      setPersonalNotes((prev) =>
+        prev.map((n) =>
+          n.id === id
+            ? { ...n, marginSide: (n.marginSide === 'right' ? 'left' : 'right') as 'left' | 'right' }
+            : n,
+        ),
+      );
+    },
+    [],
   );
 
   const submitComposer = useCallback(
@@ -595,6 +891,10 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     setTimeout(() => el.classList.remove('is-flash'), 1200);
   }, []);
 
+  useEffect(() => {
+    jumpToRef.current = jumpTo;
+  }, [jumpTo]);
+
   // Clicking a [[42]] citation link inside a note scrolls the article.
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
@@ -692,6 +992,45 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
           />
         </div>
       )}
+
+      {personalNotes
+        .filter((pn) => sideOf(pn.marginSide) === side)
+        .map((pn) => (
+          <div
+            key={pn.id}
+            className="note-slot"
+            ref={(el) => registerCardRef(pn.id, el)}
+          >
+            <PersonalNoteCard
+              note={pn}
+              active={false}
+              onFocus={() => {}}
+              onDelete={removePersonalNote}
+              onEdit={updatePersonalNote}
+              onFlip={canFlip ? () => flipPersonalNote(pn.id) : null}
+            />
+          </div>
+        ))}
+
+      {personalComposer && sideOf(personalComposer.marginSide) === side && (
+        <div className="note-slot" ref={(el) => registerCardRef('personal-composer', el)}>
+          <PersonalNoteComposer
+            target={personalComposer}
+            onSubmit={submitPersonalNote}
+            onCancel={() => setPersonalComposer(null)}
+            onFlip={
+              canFlip
+                ? () =>
+                    setPersonalComposer((c) =>
+                      c
+                        ? { ...c, marginSide: c.marginSide === 'right' ? 'left' : 'right' }
+                        : c,
+                    )
+                : null
+            }
+          />
+        </div>
+      )}
     </>
   );
 
@@ -709,6 +1048,55 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         <div className="reader-bar-right">
           {noteCount > 0 && (
             <span className="reader-meta">{noteCount} note{noteCount === 1 ? '' : 's'}</span>
+          )}
+          {personalNotes.length > 0 && (
+            <span className="reader-meta">{personalNotes.length} personal {personalNotes.length === 1 ? 'note' : 'notes'}</span>
+          )}
+          <button
+            className={`reader-chip${bookmark ? ' is-bookmark-update' : ''}`}
+            onClick={saveBookmarkNow}
+            title={
+              bookmark
+                ? `Update bookmark to where you are now (⌘B / B) · saved ${formatRelativeTime(bookmark.updatedAt)}`
+                : 'Bookmark where you are now (⌘B / B)'
+            }
+          >
+            {bookmark ? 'Update bookmark' : 'Bookmark'}
+          </button>
+          {bookmark && (
+            <button
+              className={`reader-chip is-bookmark${atBookmark ? ' is-bookmark-here' : ''}`}
+              onClick={atBookmark ? undefined : jumpToBookmark}
+              disabled={atBookmark}
+              title={
+                atBookmark
+                  ? `You're at your bookmark · ${bookmark.snippet ?? `¶${bookmark.sequenceId}`} · saved ${formatRelativeTime(bookmark.updatedAt)}`
+                  : `Resume at ${bookmark.snippet ?? `¶${bookmark.sequenceId}`} · saved ${formatRelativeTime(bookmark.updatedAt)}`
+              }
+            >
+              {atBookmark ? (
+                <span className="reader-chip-line">
+                  <span className="reader-chip-glyph" aria-hidden="true">●</span>
+                  You're here
+                </span>
+              ) : (
+                <span className="reader-chip-line">
+                  <span className="reader-chip-glyph" aria-hidden="true">↧</span>
+                  <span className="reader-chip-text">{bookmark.snippet ?? `¶${bookmark.sequenceId}`}</span>
+                  <span className="reader-chip-when">{formatRelativeTime(bookmark.updatedAt)}</span>
+                </span>
+              )}
+            </button>
+          )}
+          {bookmark && (
+            <button
+              className="reader-chip is-bookmark-clear"
+              onClick={removeBookmark}
+              title="Clear bookmark"
+              aria-label="Clear bookmark"
+            >
+              ×
+            </button>
           )}
           {doc && doc.outline.length > 0 && (
             <button
@@ -774,6 +1162,7 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
                 key={block.id}
                 block={block}
                 blockTinted={tintedBlocks.has(block.sequence_order)}
+                isBookmarked={bookmark?.sequenceId === block.sequence_order}
                 active={
                   activeNoteId != null &&
                   groups.some(
@@ -795,20 +1184,37 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         </div>
 
         {pill && (
-          <button
-            className="ask-pill"
+          <div
+            className="ask-pill-group"
             style={{ top: pill.top, left: pill.left }}
             onMouseDown={(e) => e.preventDefault()}
-            onClick={openComposerFromSelection}
           >
-            Ask
-          </button>
+            <button className="ask-pill" onClick={openComposerFromSelection}>
+              Ask
+            </button>
+            <button className="ask-pill is-note" onClick={openPersonalComposerFromSelection}>
+              Note
+            </button>
+            <button className="ask-pill is-bookmark" onClick={saveBookmarkFromSelection}>
+              Bookmark
+            </button>
+          </div>
         )}
       </div>
 
-      {!composer && (
+      {!composer && !personalComposer && (
         <button className="ask-fab" onClick={openComposerAtViewport} title="Ask about what you're reading (A)">
           Ask
+        </button>
+      )}
+
+      {!composer && !personalComposer && (
+        <button
+          className="ask-fab note-fab"
+          onClick={openPersonalComposerAtViewport}
+          title="Add your own note (N)"
+        >
+          Note
         </button>
       )}
     </div>

@@ -39,6 +39,8 @@ interface Props {
   blockTinted: boolean;
   /** True when this block is the anchor of the note the reader is focused on. */
   active: boolean;
+  /** True when this block is the saved reading-progress bookmark. */
+  isBookmarked: boolean;
   /**
    * Open the composer on a block that cannot be reached by highlighting.
    * Figures are images, and a KaTeX equation is a tree of spans that drag-
@@ -48,7 +50,7 @@ interface Props {
   registerRef: (seq: number, el: HTMLElement | null) => void;
 }
 
-function ArticleBlockImpl({ block, blockTinted, active, onAsk, registerRef }: Props) {
+function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, registerRef }: Props) {
   const seq = block.sequence_order;
   const common = {
     'data-seq': String(seq),
@@ -59,6 +61,7 @@ function ArticleBlockImpl({ block, blockTinted, active, onAsk, registerRef }: Pr
       'article-block',
       blockTinted ? 'is-tinted' : '',
       active ? 'is-active' : '',
+      isBookmarked ? 'is-bookmarked' : '',
     ].filter(Boolean).join(' '),
   };
 

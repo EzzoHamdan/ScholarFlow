@@ -281,9 +281,79 @@ body {
   border: 1px solid var(--border);
   color: var(--fg-2);
   background: var(--bg);
-  transition: border-color 140ms ease, color 140ms ease;
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
 }
 .reader-chip:hover { border-color: var(--accent); color: var(--accent); }
+/* Once a bookmark exists, "Bookmark" turns into "Update bookmark" — the label
+   change matters more than the color (overwriting the bookmark is the safe
+   direction, so we don't want to alarm the reader with red). */
+.reader-chip.is-bookmark-update { color: var(--muted); }
+.reader-chip.is-bookmark-update:hover { color: var(--accent); }
+/* The Resume chip is the one that has to do work. Two states:
+   - default: a navigation target — accent color, click jumps to the bookmark.
+   - "here"   : the bookmarked block is the topmost visible block — a quiet,
+                 disabled "you're here" indicator so the chip doesn't pretend
+                 to offer a no-op jump. */
+.reader-chip.is-bookmark {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  max-width: 320px;
+}
+.reader-chip.is-bookmark:disabled {
+  cursor: default;
+}
+.reader-chip.is-bookmark-here {
+  color: var(--ok);
+  border-color: color-mix(in oklch, var(--ok), var(--border) 45%);
+  background: color-mix(in oklch, var(--ok), var(--bg) 88%);
+}
+.reader-chip.is-bookmark-here:hover {
+  color: var(--ok);
+  border-color: color-mix(in oklch, var(--ok), var(--border) 25%);
+}
+.reader-chip-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  min-width: 0;
+}
+.reader-chip-glyph {
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.85;
+  flex-shrink: 0;
+}
+.reader-chip-text {
+  font-family: 'Newsreader', ui-serif, Georgia, serif;
+  font-size: 13px;
+  font-style: italic;
+  font-weight: 400;
+  line-height: 1.25;
+  /* Single-line preview of the snippet — long text just truncates. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.reader-chip-when {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  opacity: 0.65;
+  flex-shrink: 0;
+  /* Pad from the snippet so they don't fuse visually. */
+  padding-left: 2px;
+}
+.reader-chip.is-bookmark-clear {
+  font-size: 13px;
+  line-height: 1;
+  padding: 4px 8px;
+  color: var(--muted);
+  border-color: var(--border);
+}
+.reader-chip.is-bookmark-clear:hover { color: #c0392b; border-color: #c0392b; }
 .reader-progress {
   position: absolute;
   left: 0;
@@ -398,6 +468,14 @@ body {
 }
 .article-block.is-active {
   background: color-mix(in oklch, var(--accent-soft), transparent 55%);
+}
+.article-block.is-bookmarked {
+  /* A thicker stripe + a faint green tint — the bookmark is the one place in
+     the reader that is guaranteed to mean something to the user on a return
+     visit, so it should be findable at a glance, not only on careful reading. */
+  box-shadow: -16px 0 0 -10px var(--ok), inset 4px 0 0 0 var(--ok);
+  background: color-mix(in oklch, var(--ok), transparent 92%);
+  border-radius: 4px;
 }
 .article-block.is-flash {
   animation: block-flash 1.2s ease;
@@ -588,6 +666,21 @@ body {
   box-shadow: 0 6px 24px -14px rgba(0, 0, 0, 0.35);
 }
 .note-card.is-composer { border-color: var(--accent); }
+.note-card.is-personal { border-color: color-mix(in oklch, var(--ok), var(--border) 55%); }
+.note-card.is-personal .note-quote { border-color: var(--ok); }
+.gutter-left .note-card.is-personal .note-quote {
+  border-right-color: var(--ok);
+  border-left: none;
+}
+
+.note-kind {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ok);
+  margin-bottom: 8px;
+}
 
 .note-quote {
   font-family: 'Newsreader', ui-serif, Georgia, serif;
@@ -772,10 +865,15 @@ body {
 .note-card textarea::placeholder { color: var(--faint); }
 
 /* ── Ask affordances ─────────────────────────────────────────── */
-.ask-pill {
+.ask-pill-group {
   position: absolute;
   transform: translateX(-50%);
   z-index: 25;
+  display: flex;
+  gap: 6px;
+  animation: ask-pill-in 130ms ease;
+}
+.ask-pill {
   font-size: 11.5px;
   font-weight: 500;
   padding: 5px 14px;
@@ -783,7 +881,16 @@ body {
   color: var(--accent-fg);
   background: var(--accent);
   box-shadow: 0 6px 20px -8px rgba(0, 0, 0, 0.45);
-  animation: ask-pill-in 130ms ease;
+  transition: background 140ms ease, transform 140ms ease;
+}
+.ask-pill:hover { transform: translateY(-1px); }
+.ask-pill.is-note {
+  color: var(--accent-fg);
+  background: var(--ok);
+}
+.ask-pill.is-bookmark {
+  color: var(--accent-fg);
+  background: color-mix(in oklch, var(--accent), var(--ok) 30%);
 }
 @keyframes ask-pill-in {
   from { opacity: 0; transform: translate(-50%, -4px); }
@@ -805,6 +912,12 @@ body {
   transition: border-color 140ms ease, color 140ms ease;
 }
 .ask-fab:hover { border-color: var(--accent); color: var(--accent); }
+.note-fab {
+  right: 26px;
+  bottom: 74px;
+  border-color: color-mix(in oklch, var(--ok), var(--border-strong) 40%);
+}
+.note-fab:hover { border-color: var(--ok); color: var(--ok); }
 
 .reader-notice {
   max-width: 680px;
