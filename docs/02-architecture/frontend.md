@@ -201,6 +201,19 @@ among its members** (`deckSeq`), so flipping through it never makes it drift.
 | Drop below two cards → not a deck | `ArticleReader.tsx::pruneDecks`, mirrored server-side |
 | Optimistic write + rollback + stale-response guard | `ArticleReader.tsx::commitDecks` |
 | Stack visual, pager, study mode, spread | [`DeckCard.tsx`](../../frontend/src/views/DeckCard.tsx) |
+| The card turn | `DeckCard.tsx::flipTo` + `deck-turn-*` keyframes |
+
+**Changing card is a card being turned over**, not a crossfade. `flipTo` runs a two-phase Y
+rotation on **one** element and swaps the content at the midpoint, where the card is ~86° to the
+viewer and unreadable — so the incoming face arrives from the opposite edge. Mounting two faces
+would double every card's state (a follow-up composer, a collapse toggle) and leave the hidden one
+in the tab order. The stage height is pinned for the turn and eased to the new card's height on the
+way out, so a short card following a tall one cannot snap the margin upward mid-flip. Revealing a
+study card uses the same turn — that is the flashcard gesture.
+
+⚠ `FLIP_OUT_MS` / `FLIP_IN_MS` in `DeckCard.tsx` **duplicate** the durations of the `deck-turn-*`
+keyframes in `index.css`. The swap is scheduled in JS, so the two must be changed together; a
+mismatch either swaps the text in plain view or leaves the card sitting on its edge.
 
 `stackDecks` is kept out of the component and pure because **its result is what gets written** —
 the whole arrangement is `PUT` in one request, so it must be correct on its own rather than as a
