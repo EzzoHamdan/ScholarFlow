@@ -1414,16 +1414,57 @@ body {
   color: var(--fg-2);
 }
 
-/* Changing card animates as a turn rather than a swap, so the stack behaves
-   like the object it is drawn as. */
-.deck-face {
-  animation: deck-turn 260ms cubic-bezier(0.22, 1, 0.36, 1);
-  transform-origin: left center;
+/* ── The turn ────────────────────────────────────────────────────────────
+   Changing card is a card being turned over, not a crossfade. Two halves,
+   with the content swapped at the midpoint where the card is edge-on and
+   nothing can be read anyway — which is exactly how you can get away with
+   one element instead of two stacked faces.
+
+   ⚠ The durations here are duplicated in DeckCard.tsx (FLIP_OUT_MS /
+   FLIP_IN_MS) because the swap is scheduled in JS. Change both. */
+.deck-stage {
+  /* Perspective belongs on the parent of the rotating element, and this is
+     also what holds the height steady across the swap. */
+  perspective: 1400px;
+  perspective-origin: 50% 40%;
+  transition: height 240ms cubic-bezier(0.22, 1, 0.36, 1);
 }
-.gutter-left .deck-face { transform-origin: right center; }
-@keyframes deck-turn {
-  from { opacity: 0; transform: perspective(760px) rotateY(-14deg) translateX(7px); }
-  to   { opacity: 1; transform: perspective(760px) rotateY(0deg) translateX(0); }
+.deck-face {
+  transform-origin: 50% 50%;
+  backface-visibility: hidden;
+  will-change: transform, opacity;
+}
+.deck-face.is-out.dir-next  { animation: deck-turn-out-next 150ms ease-in forwards; }
+.deck-face.is-in.dir-next   { animation: deck-turn-in-next 230ms cubic-bezier(0.22, 1, 0.36, 1); }
+.deck-face.is-out.dir-prev  { animation: deck-turn-out-prev 150ms ease-in forwards; }
+.deck-face.is-in.dir-prev   { animation: deck-turn-in-prev 230ms cubic-bezier(0.22, 1, 0.36, 1); }
+
+/* Rotating past 90° would show the mirrored back of the same element, so
+   each half stops just short of the edge and the swap happens there. The
+   slight scale-down is the card moving away from you as it turns. */
+@keyframes deck-turn-out-next {
+  from { transform: rotateY(0deg) scale(1); opacity: 1; }
+  to   { transform: rotateY(-86deg) scale(0.94); opacity: 0.15; }
+}
+@keyframes deck-turn-in-next {
+  from { transform: rotateY(86deg) scale(0.94); opacity: 0.15; }
+  to   { transform: rotateY(0deg) scale(1); opacity: 1; }
+}
+@keyframes deck-turn-out-prev {
+  from { transform: rotateY(0deg) scale(1); opacity: 1; }
+  to   { transform: rotateY(86deg) scale(0.94); opacity: 0.15; }
+}
+@keyframes deck-turn-in-prev {
+  from { transform: rotateY(-86deg) scale(0.94); opacity: 0.15; }
+  to   { transform: rotateY(0deg) scale(1); opacity: 1; }
+}
+
+/* The rest of the stack settles while the top card is in the air — small,
+   but it is what stops the deck reading as a single card with changing text. */
+.deck.is-turning .deck-edge-1 { bottom: -12px; }
+.deck.is-turning .deck-edge-2 { bottom: -22px; }
+.deck.is-turning .deck-edge {
+  border-color: color-mix(in oklab, var(--deck), var(--border) 25%);
 }
 /* The face inherits its member's colour so the quote rule keeps saying
    whether you are looking at a question or something you wrote. */
@@ -1542,6 +1583,9 @@ body {
   .marg-panel,
   .marg-scrim,
   .ask-pill-group { animation: none; }
+  /* DeckCard also skips the two-phase swap entirely under this preference,
+     so the card changes in one commit rather than sitting at 86°. */
+  .deck-stage { transition: none; }
   .layout-right-only .note-slot,
   .layout-both .note-slot { transition: none; }
 }

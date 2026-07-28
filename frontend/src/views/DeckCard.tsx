@@ -30,6 +30,22 @@ export interface DeckFace {
   seq: number;
 }
 
+/**
+ * Halves of the turn. `out` ends with the card edge-on, so it is short — it
+ * is dead time before anything changes. `in` carries the new face back to
+ * flat and gets the longer, eased half, which is the part that reads as
+ * weight. Both must match the durations in `deck-flip-*` in index.css.
+ */
+const FLIP_OUT_MS = 150;
+const FLIP_IN_MS = 230;
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+  );
+}
+
 export function DeckCard({
   deck,
   faces,
@@ -73,6 +89,25 @@ export function DeckCard({
   const [revealedAt, setRevealedAt] = useState<number | null>(null);
   const labelRef = useRef<HTMLInputElement>(null);
 
+  // The turn: which half is running, which way, and the height held steady
+  // across the swap.
+  const [flip, setFlip] = useState<{ dir: 1 | -1; phase: 'out' | 'in' } | null>(null);
+  const [lockHeight, setLockHeight] = useState<number | null>(null);
+  const flipping = useRef(false);
+  const faceRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const timers = useRef<number[]>([]);
+
+  // A deck can be spread, or its card taken out, mid-turn. Without this the
+  // pending timeout calls setState on an unmounted component.
+  useEffect(
+    () => () => {
+      timers.current.forEach(window.clearTimeout);
+      timers.current = [];
+    },
+    [],
+  );
+
   const count = faces.length;
   const top = Math.min(Math.max(deck.top, 0), Math.max(count - 1, 0));
   const face = faces[top];
@@ -81,15 +116,75 @@ export function DeckCard({
     if (renaming) labelRef.current?.focus({ preventScroll: true });
   }, [renaming]);
 
+  /**
+   * Turn the card over, and change what it says while it is edge-on.
+   *
+   * A physical card does not dissolve into the next one — it rotates until
+   * you are looking at its edge, and comes back showing something else. So
+   * the swap happens at the midpoint of a two-phase Y rotation, where the
+   * card is ~90° to the viewer and effectively invisible. One element does
+   * both halves: mounting a second face would double every card's state (a
+   * follow-up composer, a collapse toggle) and leave the hidden one in the
+   * tab order.
+   *
+   * The height is pinned for the turn and released on the way out, so a
+   * shorter card following a taller one does not snap the whole margin
+   * upward while the flip is still running.
+   */
+  const flipTo = (dir: 1 | -1, apply: () => void) => {
+    if (flipping.current) {
+      apply();
+      return;
+    }
+    if (prefersReducedMotion()) {
+      apply();
+      return;
+    }
+    flipping.current = true;
+    setLockHeight(faceRef.current?.offsetHeight ?? null);
+    setFlip({ dir, phase: 'out' });
+
+    timers.current.push(
+      window.setTimeout(() => {
+        apply();
+        setFlip({ dir, phase: 'in' });
+        // The new content is mounted but not yet measured — wait a frame,
+        // then let the pinned height ease to whatever it actually needs.
+        requestAnimationFrame(() => {
+          setLockHeight(innerRef.current?.offsetHeight ?? null);
+          timers.current.push(
+            window.setTimeout(() => {
+              setFlip(null);
+              setLockHeight(null);
+              flipping.current = false;
+            }, FLIP_IN_MS),
+          );
+        });
+      }, FLIP_OUT_MS),
+    );
+  };
+
   const go = (next: number) => {
-    if (count === 0) return;
-    onTopChange(((next % count) + count) % count);
-    setRevealedAt(null);
+    if (count < 2) return;
+    const target = ((next % count) + count) % count;
+    if (target === top) return;
+    // Shortest way round decides which way the card turns, so the last card
+    // wrapping to the first still reads as "forward".
+    const forward = (target - top + count) % count <= count / 2;
+    flipTo(forward ? 1 : -1, () => {
+      onTopChange(target);
+      setRevealedAt(null);
+    });
   };
 
   if (!face) return null;
 
-  const study = deck.study ? { revealed: revealedAt === top, onReveal: () => setRevealedAt(top) } : null;
+  const study = deck.study
+    ? {
+        revealed: revealedAt === top,
+        onReveal: () => flipTo(1, () => setRevealedAt(top)),
+      }
+    : null;
 
   const commitRename = () => {
     const trimmed = draftLabel.trim();
@@ -104,6 +199,7 @@ export function DeckCard({
         dragging ? 'is-dragging' : '',
         isDropTarget ? 'is-drop-target' : '',
         deck.study ? 'is-study' : '',
+        flip ? 'is-turning' : '',
       ].filter(Boolean).join(' ')}
       onMouseEnter={onFocus}
       {...zoneProps}
@@ -198,11 +294,24 @@ export function DeckCard({
           />
         ) : null}
 
-        {/* Keying on the position and the reveal restarts the turn-in
-            animation, so changing card reads as the stack being flicked
-            rather than the text silently swapping underneath you. */}
-        <div className="deck-face" key={`${top}-${study?.revealed ? 'back' : 'front'}`}>
-          {renderFace(face, study)}
+        {/* The turn. The wrapper owns the perspective and the pinned height;
+            the inner element is what actually rotates. Keying it on the
+            phase restarts the animation for each half. */}
+        <div
+          className="deck-stage"
+          style={lockHeight != null ? { height: lockHeight } : undefined}
+        >
+          <div
+            ref={faceRef}
+            key={flip ? `${flip.phase}-${top}-${study?.revealed ? 'b' : 'f'}` : `${top}-${study?.revealed ? 'b' : 'f'}`}
+            className={[
+              'deck-face',
+              flip ? `is-${flip.phase}` : '',
+              flip ? (flip.dir === 1 ? 'dir-next' : 'dir-prev') : '',
+            ].filter(Boolean).join(' ')}
+          >
+            <div ref={innerRef}>{renderFace(face, study)}</div>
+          </div>
         </div>
 
         <div className="deck-foot">
