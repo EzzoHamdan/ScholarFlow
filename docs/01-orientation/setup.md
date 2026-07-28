@@ -11,7 +11,8 @@
 > what listens where ([runtime-topology.md](runtime-topology.md)), fixing a broken install
 > ([operations.md](operations.md)).
 >
-> **Status:** current · **Last verified:** 2026-07-25
+> **Status:** current · **Last verified:** 2026-07-28 (`main`, 5471870) — §5 run end-to-end from
+> `docker compose down` to a healthy stack
 > **Verify with:** `curl -s localhost:8000/api/v1/health | jq`
 
 ---
@@ -175,8 +176,24 @@ A sample paper ships at [`samples/attention-is-all-you-need.pdf`](../../samples/
 | Mode | Command | Use when |
 | --- | --- | --- |
 | Host dev | §3 above | Normal development — hot reload on both sides |
-| Full stack in Docker | `docker compose --profile server up -d --build` | UI + API on `:8000`, no Node needed on the host |
+| Full stack in Docker | `cd backend && docker compose up -d --build` | UI + API on `:8000`, no Node needed on the host |
 | LAN server | `cd backend && ./start-lan-server.sh` | Let another device on the same Wi-Fi use the app |
+
+**Full stack** brings up every service — Postgres, Redis, SearXNG, the Celery worker, the API, and
+a one-shot container that builds the SPA into a volume the API serves at `/`. The whole app is on
+one port; there is no second dev server and no reverse proxy.
+
+`[historical]` This used to require `--profile server`. Without the flag the frontend build never
+ran, so `up` produced an API with an empty SPA volume that served nothing at `/`. The build service
+is no longer behind a profile, and `api` waits for it via
+`depends_on: {frontend-build: {condition: service_completed_successfully}}` — which also makes a
+broken frontend build **fail the `up` loudly** instead of quietly starting an API with no UI.
+
+⚠ **If another project on your machine already holds `8000`, `5432`, `6379` or `8080`, `up` fails
+with "port is already allocated."** Every mapping is overridable in `backend/.env` —
+`API_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `SEARXNG_PORT` (see
+[`.env.example`](../../backend/.env.example)). Only the **host** side moves: containers reach each
+other by service name on the compose network, so nothing inside the stack is affected.
 
 `start-lan-server.sh` builds the SPA in a container, removes the upload cap, raises the MinerU
 timeout for large books, prints the exact LAN URL, streams logs, and tears the stack down on
@@ -195,6 +212,8 @@ Collected because each one has cost someone an hour:
 | --- | --- | --- |
 | Upload sticks at `queued` forever | No Celery worker consuming Redis | Start the worker (§3.3) |
 | `pip install -e .` fails, no `pyproject.toml` | It is gitignored, so it is not in the clone | `pip install -r requirements.txt` |
+| `docker compose up` fails with "port is already allocated" | Another project holds `8000` / `5432` / `6379` / `8080` | Set `API_PORT` / `POSTGRES_PORT` / `REDIS_PORT` / `SEARXNG_PORT` in `backend/.env` — host side only |
+| Worker logs `Cannot connect to redis://redis:6379: Name or service not known` | A container left over from an older `up` is attached to no compose network | `docker compose up -d --force-recreate redis celery_worker` |
 | First embed 404s | `EMBEDDING_MODEL` has no matching pulled tag | Use an explicit tag, e.g. `qwen3-embedding:8b` |
 | Every model call refused, in Docker | `OLLAMA_BASE_URL=localhost` inside a container resolves to the container | Compose already sets `host.docker.internal`; do not override it from the host `.env` |
 | Web search silently returns nothing | SearXNG not running | `docker compose up -d searxng` |

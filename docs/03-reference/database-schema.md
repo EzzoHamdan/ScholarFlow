@@ -6,8 +6,8 @@
 > **Does not own:** how the schema is applied ([migrations.md](migrations.md)), what the data
 > means in flow ([overview.md](../02-architecture/overview.md)).
 >
-> **Status:** current · **Last verified:** 2026-07-25 against
-> [`database/schema.sql`](../../backend/app/database/schema.sql) (`main`, 9b75500)
+> **Status:** current · **Last verified:** 2026-07-28 against
+> [`database/schema.sql`](../../backend/app/database/schema.sql) (`main`, 5471870)
 > **Verify with:** `\d+ <table>` in psql — the live database is authoritative
 >
 > ⚠ One FK deviates from the pattern: `conversation_turns.document_id` is `ON DELETE SET NULL`,
@@ -36,7 +36,19 @@ documents (1) ─────< (N) figure_descriptions
 documents (1) ─────< (N) paper_notes
             paper_notes ── anchor_chunk_id → chunks.id  (SET NULL)
             paper_notes ── parent_note_id  → paper_notes.id (follow-ups)
+
+documents (1) ─────< (N) reading_bookmarks
+documents (1) ─────< (N) personal_notes
+            personal_notes ── anchor_chunk_id → chunks.id (SET NULL)
+documents (1) ─────< (N) note_decks
+            note_decks ─────< (N) note_deck_members
+                              note_deck_members ── ai_note_id       → paper_notes.id    ┐ exactly
+                              note_deck_members ── personal_note_id → personal_notes.id ┘ one set
 ```
+
+What the deck edges rule out: a member row pointing at nothing, and a member row pointing at both.
+The `CHECK` makes "exactly one" a storage guarantee, so a deck can never hold a card that is
+neither an answer nor a note.
 
 ### (rendered)
 
@@ -55,10 +67,21 @@ erDiagram
     conversation_turns ||--o{ ask_traces         : "cascade"
     conversation_turns ||--o{ conversation_turns : "sub-thread"
     paper_notes        ||--o{ paper_notes        : "follow-up"
+    documents          ||--o{ reading_bookmarks  : "cascade"
+    documents          ||--o{ personal_notes     : "cascade"
+    documents          ||--o{ note_decks         : "cascade"
+    chunks             |o--o{ personal_notes     : "anchor, SET NULL"
+    note_decks         ||--o{ note_deck_members  : "cascade"
+    paper_notes        |o--o{ note_deck_members  : "member, cascade"
+    personal_notes     |o--o{ note_deck_members  : "member, cascade"
 ```
 
 All FKs use `ON DELETE CASCADE` except `conversation_turns.document_id`
 which uses `SET NULL` (so a chat about a deleted paper survives).
+
+Two `documents` sub-trees, deliberately not merged: **`paper_notes`** is what the model answered,
+**`reading_bookmarks` / `personal_notes` / `note_decks`** are what the reader did. A deck spans
+both — it is the one place they meet, and it owns neither.
 
 ## Tables
 
@@ -276,6 +299,104 @@ survives, so a re-chunk degrades an anchor's precision instead of destroying the
 
 Indexes: `(document_id, anchor_sequence_id, created_at)` — the exact order the margin lays cards
 out in — and `(parent_note_id)` for thread loading.
+
+## Personal reading state
+
+What the reader did to a paper, as opposed to what the model answered. Four tables, written by
+[repositories/personal.py](../../backend/app/database/repositories/personal.py), served by
+[endpoints/personal.py](../../backend/app/api/v1/endpoints/personal.py).
+Endpoints: [api.md § Personal reading state](api.md#personal-reading-state).
+
+`[historical]` These lived in browser `localStorage` until 2026-07-28.
+
+### `reading_bookmarks`
+
+A place worth coming back to. Several per paper.
+
+| Column        | Type          | Notes                                                        |
+| ------------- | ------------- | ------------------------------------------------------------ |
+| `id`          | `UUID`        | PK.                                                           |
+| `document_id` | `UUID`        | FK → `documents.id`, cascade.                                 |
+| `sequence_id` | `INTEGER`     | The durable anchor — same rule as `paper_notes`.              |
+| `snippet`     | `TEXT`        | Preview of the block, cached at save time so the list renders without loading the document. A re-chunk can make it stale: a slightly wrong preview beats an empty one. |
+| `kind`        | `TEXT`        | `text / figure / equation / block`, for labelling the row.    |
+| `page`        | `INTEGER`     | Page the mark sits on, when known.                            |
+| `progress`    | `REAL`        | Scroll fraction when the mark was made.                       |
+| `label`       | `TEXT`        | Optional name the reader gave it.                             |
+| `created_at`  | `TIMESTAMPTZ` |                                                               |
+| `updated_at`  | `TIMESTAMPTZ` |                                                               |
+
+⚠ **Unique on `(document_id, sequence_id)` — one mark per block, guaranteed.** The reader treats a
+second press on a bookmarked block as "actually, not here", so a duplicate is always a bug rather
+than an intent worth storing. `POST /bookmarks` is therefore an upsert, not an insert.
+
+### `personal_notes`
+
+Something the reader wrote, anchored beside the passage that prompted it. Deliberately **not** a
+row in `paper_notes`: it has no question, no model, no citations, and no thread, and sharing that
+table would mean carrying eight unused columns into every endpoint that lists answers.
+
+| Column               | Type          | Notes                                                  |
+| -------------------- | ------------- | ------------------------------------------------------ |
+| `id`                 | `UUID`        | PK.                                                     |
+| `document_id`        | `UUID`        | FK → `documents.id`, cascade.                           |
+| `anchor_chunk_id`    | `UUID`        | FK → `chunks.id`, **`SET NULL`** — same re-chunk reasoning as `paper_notes`. |
+| `anchor_sequence_id` | `INTEGER`     | The durable anchor.                                     |
+| `anchor_quote`       | `TEXT`        | The highlighted passage, re-located and painted on load. |
+| `body`               | `TEXT`        | Markdown, rendered by the same pipeline as an answer.   |
+| `margin_side`        | `TEXT`        | `right` (default) or `left`.                            |
+| `created_at`         | `TIMESTAMPTZ` |                                                         |
+| `updated_at`         | `TIMESTAMPTZ` | Bumped on every edit.                                   |
+
+Index: `(document_id, anchor_sequence_id, created_at)` — the margin's layout order.
+
+### `note_decks`
+
+A stack of cards sharing one slot in the margin. **A deck owns nothing**: its members are notes
+that go on existing independently, so spreading a deck leaves every note exactly as it was. What it
+buys is vertical space, which is the gutter's scarce resource.
+
+| Column        | Type          | Notes                                                        |
+| ------------- | ------------- | ------------------------------------------------------------ |
+| `id`          | `UUID`        | PK. ⚠ **Supplied by the client** and preserved across writes, so an untouched deck keeps its identity. |
+| `document_id` | `UUID`        | FK → `documents.id`, cascade.                                 |
+| `label`       | `TEXT`        | Optional name.                                                |
+| `top_index`   | `INTEGER`     | Which member is face-up. Clamped to the member count on write. |
+| `margin_side` | `TEXT`        | `right` (default) or `left`. Members keep their own side, restored when the deck is spread. |
+| `study`       | `BOOLEAN`     | Study mode hides each answer until the reader asks for it.    |
+| `created_at`  | `TIMESTAMPTZ` | Also the ordering key when listing.                           |
+| `updated_at`  | `TIMESTAMPTZ` |                                                               |
+
+### `note_deck_members`
+
+Deck membership, in stacking order.
+
+| Column             | Type      | Notes                                                     |
+| ------------------ | --------- | --------------------------------------------------------- |
+| `deck_id`          | `UUID`    | FK → `note_decks.id`, cascade. PK with `ordinal`.          |
+| `ordinal`          | `INTEGER` | Position in the stack, 0-based.                            |
+| `ai_note_id`       | `UUID`    | FK → `paper_notes.id`, cascade.                            |
+| `personal_note_id` | `UUID`    | FK → `personal_notes.id`, cascade.                         |
+
+`CHECK ((ai_note_id IS NULL) <> (personal_note_id IS NULL))` — exactly one is set. A member is
+either an answer or a note, never both and never neither.
+
+⚠ **Two nullable foreign keys rather than one polymorphic id, on purpose.** This buys real
+referential integrity: deleting a note removes it from its deck automatically, instead of leaving
+a dangling reference for the client to notice and skip. The cost is the `CHECK` above.
+
+Partial unique indexes `idx_deck_members_ai` and `idx_deck_members_personal` make **"a card belongs
+to at most one deck"** a storage guarantee rather than something the client is trusted to maintain.
+
+⚠ That guarantee has a sharp edge for writers. The index does not care that the row it collides
+with is one the same statement is about to delete, so **membership must be cleared for the whole
+document before any row is inserted** — otherwise swapping two cards between two decks fails with a
+unique violation. See `personal.py::replace_decks` and
+`tests/test_personal_state.py::test_two_cards_can_swap_decks_in_one_write`.
+
+**A deck of fewer than two cards is not a deck.** Membership rows vanish with their notes, so a
+deck can be reduced from the outside at any time; `personal.py::prune_thin_decks` drops those and
+runs on every read of `GET /personal` and `GET /decks`, and after a personal-note delete.
 
 ## Status state machines
 

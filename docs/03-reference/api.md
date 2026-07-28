@@ -5,8 +5,8 @@
 > **Owns:** endpoint paths, request/response shapes, status codes.
 > **Does not own:** why a route behaves as it does ([chat-and-ask.md](../02-architecture/chat-and-ask.md)).
 >
-> **Status:** current · **Last verified:** 2026-07-25 against
-> [`api/v1/router.py`](../../backend/app/api/v1/router.py) (`main`, 9b75500)
+> **Status:** current · **Last verified:** 2026-07-28 against
+> [`api/v1/router.py`](../../backend/app/api/v1/router.py) (`main`, 5471870)
 > **Verify with:** `http://localhost:8000/docs` (live OpenAPI, always authoritative)
 
 All endpoints live under the prefix **`/api/v1`** and are registered in
@@ -34,6 +34,17 @@ GET    /papers/{paper_id}/notes
 POST   /papers/{paper_id}/notes/stream
 PATCH  /papers/{paper_id}/notes/{note_id}/margin
 DELETE /papers/{paper_id}/notes/{note_id}
+GET    /papers/{paper_id}/personal
+GET    /papers/{paper_id}/bookmarks
+POST   /papers/{paper_id}/bookmarks
+PATCH  /papers/{paper_id}/bookmarks/{bookmark_id}
+DELETE /papers/{paper_id}/bookmarks/{bookmark_id}
+GET    /papers/{paper_id}/personal-notes
+POST   /papers/{paper_id}/personal-notes
+PATCH  /papers/{paper_id}/personal-notes/{note_id}
+DELETE /papers/{paper_id}/personal-notes/{note_id}
+GET    /papers/{paper_id}/decks
+PUT    /papers/{paper_id}/decks
 POST   /papers/{paper_id}/ask
 POST   /papers/{paper_id}/ask/stream
 GET    /papers/{paper_id}/chat
@@ -377,6 +388,105 @@ Body `{"margin_side": "left" | "right"}` → `{"id", "margin_side"}`. 400 on any
 ### `DELETE /papers/{paper_id}/notes/{note_id}`
 
 `204`. Follow-ups cascade with the root.
+
+---
+
+## Personal reading state
+
+Source: [endpoints/personal.py](../../backend/app/api/v1/endpoints/personal.py). Tables:
+[database-schema.md](database-schema.md#personal-reading-state).
+
+Everything in the reader that belongs to the person rather than the paper — **bookmarks**, the
+reader's **own notes**, and **decks**. Distinct from `/notes` above, which is what the *model*
+answered.
+
+`[historical]` This lived in `localStorage` until 2026-07-28, which made it per-browser. The
+client migrates any leftover local copy on first open and then erases it — see
+[frontend.md](../02-architecture/frontend.md#personal-state-and-its-migration).
+
+### `GET /papers/{paper_id}/personal`
+
+All three collections in one request. **Fetch this, not the three below** — decks reference the
+other two, so served separately a deck list can arrive describing a note a concurrent delete has
+already removed, and the margin renders a stack with a hole in it.
+
+```json
+{
+  "bookmarks": [{
+    "id": "<uuid>", "sequence_id": <int>,
+    "snippet": "<cached preview of the block>|null",
+    "kind": "text|figure|equation|block",
+    "page": <int>|null, "progress": <float 0..1>,
+    "label": "<reader-supplied name>|null",
+    "updated_at": "<iso8601>|null"
+  }],
+  "notes": [{
+    "id": "<uuid>", "anchor_sequence_id": <int>, "anchor_chunk_id": "<uuid>|null",
+    "anchor_quote": "<the highlighted passage>|null",
+    "body": "<markdown>", "margin_side": "left|right",
+    "created_at": "<iso8601>", "updated_at": "<iso8601>"
+  }],
+  "decks": [{
+    "id": "<uuid>", "label": "<name>|null", "top": <int>,
+    "margin_side": "left|right", "study": <bool>,
+    "members": [{"kind": "ai|personal", "id": "<uuid>"}]
+  }]
+}
+```
+
+Serving this also **prunes decks left holding fewer than two cards** and commits that. Membership
+rows cascade away with their notes, so a deck can be reduced from the outside at any time.
+
+### Bookmarks
+
+| Route | Behaviour |
+| --- | --- |
+| `GET /papers/{paper_id}/bookmarks` | `{"bookmarks": [...]}`, ordered by `sequence_id`. |
+| `POST /papers/{paper_id}/bookmarks` | Body `{sequence_id, snippet?, kind?, page?, progress?, label?}` → the row. |
+| `PATCH /papers/{paper_id}/bookmarks/{bookmark_id}` | Body `{"label": "<name>\|null"}` → the row. `404` if it belongs to another paper. |
+| `DELETE /papers/{paper_id}/bookmarks/{bookmark_id}` | `204`. `404` if it belongs to another paper. |
+
+⚠ `POST` is an **upsert keyed on the block**, not an insert. Marking an already-bookmarked block
+updates that row and returns the same `id`; there is deliberately no way to put two marks on one
+block. `label` is preserved when the body omits it, so re-marking from the article never wipes a
+name set in the panel.
+
+### Personal notes
+
+| Route | Behaviour |
+| --- | --- |
+| `GET /papers/{paper_id}/personal-notes` | `{"notes": [...]}`, ordered by `anchor_sequence_id` then `created_at`. |
+| `POST /papers/{paper_id}/personal-notes` | Body `{anchor_sequence_id, body, anchor_quote?, margin_side?}` → the row. |
+| `PATCH /papers/{paper_id}/personal-notes/{note_id}` | Body `{body?, margin_side?}` → the row. Omitted fields are left alone. |
+| `DELETE /papers/{paper_id}/personal-notes/{note_id}` | `204`, and prunes any deck this left below two cards. |
+
+⚠ `anchor_chunk_id` is re-resolved from `anchor_sequence_id` server-side and is never accepted from
+the client — same re-chunk hazard as `POST /papers/{paper_id}/notes/stream` above.
+
+### Decks
+
+| Route | Behaviour |
+| --- | --- |
+| `GET /papers/{paper_id}/decks` | `{"decks": [...]}`, oldest first, members in stacking order. |
+| `PUT /papers/{paper_id}/decks` | Body `{"decks": [...]}` — replaces the paper's whole arrangement. Returns what was stored. |
+
+⚠ **`PUT` is a whole-collection replace, and that is the contract** — there is no per-deck create,
+update, or delete. One drag can dissolve a deck, create another, and move a card between two more;
+that is a single arrangement, applied in one transaction. Expressed as granular calls it becomes an
+ordered sequence with a half-applied state between every pair, and a request dropped in the middle
+leaves a card in two decks or in none.
+
+Deck `id`s are **supplied by the client** and preserved, so untouched decks keep their identity
+across a write. They must be UUIDs.
+
+The server reduces the submitted arrangement before storing it, and returns the reduced form:
+
+| Submitted | Stored |
+| --- | --- |
+| A member that is not a note on this paper | Dropped. |
+| A member listed in two decks | Kept by the first deck; dropped from the rest. |
+| A deck left with fewer than two members | Dropped entirely. |
+| `top` beyond the surviving member count | Clamped. |
 
 ---
 

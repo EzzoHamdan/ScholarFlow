@@ -3,7 +3,7 @@
 > **What this is:** the dispatcher for every doc in this repo. Find your task in the table, start
 > at the named doc, verify with the named command. This page routes; it never explains.
 >
-> **Status:** current · **Reflects code as of:** 2026-07-25 (`main`, 9b75500)
+> **Status:** current · **Reflects code as of:** 2026-07-28 (`main`, 5471870)
 > **Rule:** when a doc and the code disagree, **the code is authoritative** — and the doc is a
 > defect to be fixed in the same unit of work.
 
@@ -28,6 +28,7 @@
 | Change the schema | [03-reference/migrations.md](03-reference/migrations.md) | restart the API; watch migration logs |
 | Test a release | [04-testing/test-plan.md](04-testing/test-plan.md) | `cd backend && POSTGRES_DB=9xaipal_test pytest -v` |
 | Know what's broken or missing by design | [roadmap.md](roadmap.md) | — |
+| Check whether an idea was already tried and rejected | [decisions.md](decisions.md) | — |
 | Read or write a plan | [plans/](plans/) | — |
 
 ---
@@ -42,6 +43,9 @@ strings, not for synonyms.
 | **chunk** | One structural unit of a document — heading, paragraph, math block, table, or figure. Row in `chunks`. The atom of reading, retrieval, and note anchoring. |
 | **block** | A chunk as the article reader renders it. Same row, reader-facing name — `data-seq` on the DOM element is its `sequence_id`. |
 | **note** | One anchored question + answer, rendered in the reader's margin. Row in `paper_notes`. The paper equivalent of a chat turn. |
+| **personal note** | Something the *reader* wrote, anchored the same way. Row in `personal_notes`. Distinct from **note** above, which is what the model answered. |
+| **bookmark** | A marked block, several per paper. Row in `reading_bookmarks`. One per block, enforced by a unique constraint. |
+| **deck** | Several margin cards sharing one slot, browsed one at a time. Rows in `note_decks` + `note_deck_members`. Owns nothing — spreading one leaves every card as it was. |
 | **anchor** | Where a note hangs: `anchor_sequence_id` plus an `anchor_kind` of `text`, `figure`, `equation`, or `block`. |
 | **ingest profile** | `INGEST_PROFILE` — `fast` (a paper is done at chunking) or `full` (the historical embed → summarize chain). Books always take `full`. |
 | **paper agent** | `chat/paper_agent.py` — answers a note without embeddings, by stuffing the whole document or by driving `SEARCH`/`READ` over chunks. |
@@ -83,6 +87,7 @@ Every doc here follows these. Deviations are defects.
 docs/
 ├── README.md                  ← you are here (dispatcher + glossary)
 ├── roadmap.md                 known gaps & future work — kept out of how-it-works docs
+├── decisions.md               rejected approaches & deliberate ugliness (append-only)
 ├── 01-orientation/            get it running, understand the moving parts, fix it when broken
 │   ├── setup.md
 │   ├── runtime-topology.md

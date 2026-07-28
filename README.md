@@ -47,6 +47,9 @@ Everything runs locally by default. Your documents and conversations never leave
 - **Drag-and-drop PDF upload.** A paper is readable the moment MinerU and the chunker finish — no embedding pass, no summarization, nothing to wait for.
 - **Article reading for papers** — the whole document at once, in serif prose, with KaTeX math, extracted figures, and real tables.
 - **Margin notes** — highlight text, a figure, or an equation and ask. The answer streams into a card beside it, keeps the quote highlighted in the page, and offers jump chips back to the blocks it cites. Notes persist, thread with follow-ups, and can sit in either margin.
+- **Your own notes and bookmarks** — write a note beside any passage, and mark as many places as you like. Bookmarks show as ribbons in the text and as ticks on the progress rail, so the paper carries a map of where you have been. One panel puts contents, bookmarks and every note behind a single search.
+- **Decks** — drag one margin card onto another and they stack. The gutter's scarce resource is vertical space, and a deck spends one card's worth of it on several, so every card stays beside the passage that produced it. Turn on study mode and the deck hides each answer until you ask for it — the same stack becomes flashcards.
+- **Everything follows you** — notes, bookmarks and decks live in Postgres, not the browser, so a paper opened from another device on the network carries all of it.
 - **Answers without an index** — when a paper fits in the context window the model simply reads all of it. When it doesn't, an agent searches and reads across chunks until it has enough.
 - **Pick the model per question** — any model Ollama can serve, local or cloud-hosted, chosen from the composer. Each answer is labelled, so you can ask two models the same thing and compare. Follow-ups stay on the model the note started with.
 - **Book mode** — chapter-by-chapter study with the side chat, smart context routing (`LOCAL` / `GLOBAL` / `OVERVIEW` / `EXTERNAL`), pre-computed summaries, VLM figure descriptions, and conversation compaction.
@@ -94,9 +97,20 @@ npm install
 npm run dev      # opens at http://localhost:5173
 ```
 
-### 4. Run services via Docker (recommended)
+### 4. Or skip steps 2–3 and run the whole thing in Docker (recommended)
 ```bash
 cd backend
+docker compose up -d --build
+```
+Brings up Postgres, Redis, SearXNG, the Celery worker, the API, and a one-shot container that
+builds the SPA — then serves **the UI and the API on a single port**: <http://localhost:8000>.
+No Node or Python needed on the host. Ollama stays on your machine.
+
+If another project already holds `8000`, `5432`, `6379` or `8080`, override the host side in
+`backend/.env` — `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `SEARXNG_PORT`.
+
+Just the infrastructure, if you want to run the app from source:
+```bash
 docker compose up -d postgres redis searxng
 ```
 
