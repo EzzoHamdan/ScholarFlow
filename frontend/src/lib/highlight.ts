@@ -17,6 +17,7 @@
  */
 
 const HL_ANCHOR = 'note-anchor';
+const HL_PERSONAL = 'note-anchor-personal';
 const HL_ACTIVE = 'note-anchor-active';
 
 type HighlightRegistry = {
@@ -118,6 +119,12 @@ export interface AnchorSpec {
   noteId: string;
   sequenceId: number;
   quote: string | null;
+  /**
+   * Who made this mark. Painted in different colors so a glance at the page
+   * separates "I wrote this" from "I asked about this" without opening a
+   * single card.
+   */
+  tone: 'ai' | 'personal';
 }
 
 /**
@@ -139,7 +146,8 @@ export function paintAnchors(
     Highlight: new (...ranges: Range[]) => unknown;
   }).Highlight;
 
-  const base: Range[] = [];
+  const ai: Range[] = [];
+  const personal: Range[] = [];
   const active: Range[] = [];
 
   for (const anchor of anchors) {
@@ -151,14 +159,19 @@ export function paintAnchors(
       unmatched.push(anchor.sequenceId);
       continue;
     }
-    (anchor.noteId === activeNoteId ? active : base).push(range);
+    if (anchor.noteId === activeNoteId) active.push(range);
+    else if (anchor.tone === 'personal') personal.push(range);
+    else ai.push(range);
   }
 
-  if (base.length) highlights.set(HL_ANCHOR, new HighlightCtor(...base));
-  else highlights.delete(HL_ANCHOR);
+  const paint = (name: string, ranges: Range[]) => {
+    if (ranges.length) highlights.set(name, new HighlightCtor(...ranges));
+    else highlights.delete(name);
+  };
 
-  if (active.length) highlights.set(HL_ACTIVE, new HighlightCtor(...active));
-  else highlights.delete(HL_ACTIVE);
+  paint(HL_ANCHOR, ai);
+  paint(HL_PERSONAL, personal);
+  paint(HL_ACTIVE, active);
 
   return unmatched;
 }
@@ -168,6 +181,7 @@ export function clearAnchors(): void {
   const highlights = registry();
   if (!highlights) return;
   highlights.delete(HL_ANCHOR);
+  highlights.delete(HL_PERSONAL);
   highlights.delete(HL_ACTIVE);
 }
 

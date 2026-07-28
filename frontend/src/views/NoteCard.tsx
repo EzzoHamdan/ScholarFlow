@@ -2,6 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { MARKDOWN_REMARK, MARKDOWN_REHYPE } from '../lib/markdown';
 import { maskIncompleteMath } from '../lib/pacer';
+import {
+  CardEyebrow,
+  CardGrip,
+  Collapsible,
+  useCardDrag,
+  type CardDrag,
+} from './NoteChrome';
 import type { PaperNote } from '../api';
 
 /**
@@ -33,6 +40,17 @@ export interface NoteGroup {
 }
 
 /**
+ * Study state for a card sitting face-up in a deck.
+ *
+ * `revealed` false means show the prompt only — the question and what it was
+ * asked about — so the deck can be used to test recall rather than reread.
+ */
+export interface StudyState {
+  revealed: boolean;
+  onReveal: () => void;
+}
+
+/**
  * Which model produced this answer.
  *
  * Shown on every answer, not just when several models are in play: the whole
@@ -41,7 +59,7 @@ export interface NoteGroup {
  */
 function ModelTag({ name }: { name: string | null }) {
   if (!name) return null;
-  return <div className="note-model" title={`Answered by ${name}`}>{name}</div>;
+  return <span className="note-model" title={`Answered by ${name}`}>{name}</span>;
 }
 
 function Answer({ text }: { text: string }) {
@@ -105,20 +123,53 @@ function Quote({ kind, quote }: { kind: string; quote: string | null }) {
   return <div className="note-quote">“{quote}”</div>;
 }
 
+/**
+ * Destructive actions get one step of friction.
+ *
+ * Delete sits next to "Follow up" in a strip of quiet buttons, and a note can
+ * represent a minute of model time and a question you may not remember how you
+ * phrased. Arming the button rather than opening a dialog keeps the cost of a
+ * deliberate delete at two clicks and the cost of a misclick at zero.
+ */
+function DeleteButton({ onConfirm }: { onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 3000);
+    return () => clearTimeout(t);
+  }, [armed]);
+  return (
+    <button
+      type="button"
+      className={armed ? 'is-armed' : ''}
+      onClick={() => (armed ? onConfirm() : setArmed(true))}
+    >
+      {armed ? 'Really?' : 'Delete'}
+    </button>
+  );
+}
+
 export function PendingNoteCard({
   note,
   onRetry,
   onDismiss,
+  onJump,
 }: {
   note: PendingNote;
   onRetry: () => void;
   onDismiss: () => void;
+  onJump?: (seq: number) => void;
 }) {
   return (
     <article className="note-card is-pending">
+      <CardEyebrow
+        tone="pending"
+        seq={note.anchorSequenceId}
+        onJump={onJump}
+        right={<ModelTag name={note.model} />}
+      />
       <Quote kind={note.anchorKind} quote={note.quote} />
       <div className="note-question">{note.question}</div>
-      <ModelTag name={note.model} />
       {note.error ? (
         <>
           <div className="note-error">{note.error}</div>
@@ -149,6 +200,9 @@ export function NoteCardView({
   onDelete,
   onFollowUp,
   onFlip,
+  drag = null,
+  inDeck = false,
+  study = null,
 }: {
   group: NoteGroup;
   active: boolean;
@@ -158,11 +212,18 @@ export function NoteCardView({
   onFollowUp: (parentNoteId: string, question: string) => void;
   /** Move this card to the other margin; null when only one margin fits. */
   onFlip: (() => void) | null;
+  /** Drag-to-stack wiring; null inside a deck, where the deck is the handle. */
+  drag?: CardDrag | null;
+  /** Rendered face-up inside a deck: the deck owns the frame and the eyebrow. */
+  inDeck?: boolean;
+  study?: StudyState | null;
 }) {
   const [followUp, setFollowUp] = useState('');
   const [composing, setComposing] = useState(false);
   const followUpRef = useRef<HTMLTextAreaElement>(null);
   const last = group.replies.length ? group.replies[group.replies.length - 1] : group.root;
+  const { dragging, isDropTarget, zoneProps, gripProps } = useCardDrag(drag);
+  const rootModel = group.root.model || group.root.requested_model;
 
   // Focus without scrolling — see the note in AskComposer: an autoFocus here
   // yanks the article away from the passage the note is about.
@@ -178,26 +239,42 @@ export function NoteCardView({
     setComposing(false);
   };
 
-  return (
-    <article
-      className={`note-card ${active ? 'is-active' : ''}`}
-      onMouseEnter={onFocus}
-    >
+  // Study front: the prompt only. Everything the answer would give away stays
+  // behind the reveal.
+  if (study && !study.revealed) {
+    return (
+      <div className="note-body is-study-front">
+        <Quote kind={group.root.anchor_kind} quote={group.root.anchor_quote} />
+        <div className="note-question">{group.root.question}</div>
+        <button type="button" className="card-reveal" onClick={study.onReveal}>
+          Reveal answer
+        </button>
+      </div>
+    );
+  }
+
+  const body = (
+    <>
       <Quote kind={group.root.anchor_kind} quote={group.root.anchor_quote} />
-
       <div className="note-question">{group.root.question}</div>
-      <ModelTag name={group.root.model || group.root.requested_model} />
-      <Answer text={withCitationLinks(group.root.answer)} />
-      <CitationChips cited={group.root.cited_sequence_ids} onJump={onJump} />
 
-      {group.replies.map((reply) => (
-        <div key={reply.id} className="note-reply">
-          <div className="note-question">{reply.question}</div>
-          <ModelTag name={reply.model || reply.requested_model} />
-          <Answer text={withCitationLinks(reply.answer)} />
-          <CitationChips cited={reply.cited_sequence_ids} onJump={onJump} />
-        </div>
-      ))}
+      <Collapsible max={inDeck ? 400 : 300}>
+        <Answer text={withCitationLinks(group.root.answer)} />
+        <CitationChips cited={group.root.cited_sequence_ids} onJump={onJump} />
+
+        {group.replies.map((reply) => (
+          <div key={reply.id} className="note-reply">
+            <div className="note-question">{reply.question}</div>
+            {/* Follow-ups inherit the root's model, so the tag is only worth
+                the space when something actually answered differently. */}
+            {(reply.model || reply.requested_model) !== rootModel && (
+              <ModelTag name={reply.model || reply.requested_model} />
+            )}
+            <Answer text={withCitationLinks(reply.answer)} />
+            <CitationChips cited={reply.cited_sequence_ids} onJump={onJump} />
+          </div>
+        ))}
+      </Collapsible>
 
       <div className="note-footer">
         {composing ? (
@@ -227,7 +304,7 @@ export function NoteCardView({
         ) : (
           <div className="note-actions note-actions-quiet">
             <button type="button" onClick={() => setComposing(true)}>Follow up</button>
-            <button type="button" onClick={() => onDelete(group.root.id)}>Delete</button>
+            <DeleteButton onConfirm={() => onDelete(group.root.id)} />
             {onFlip && (
               <button
                 type="button"
@@ -246,6 +323,39 @@ export function NoteCardView({
           </div>
         )}
       </div>
+    </>
+  );
+
+  if (inDeck) return <div className="note-body">{body}</div>;
+
+  return (
+    <article
+      className={[
+        'note-card is-ai',
+        active ? 'is-active' : '',
+        dragging ? 'is-dragging' : '',
+        isDropTarget ? 'is-drop-target' : '',
+      ].filter(Boolean).join(' ')}
+      onMouseEnter={onFocus}
+      {...zoneProps}
+    >
+      <CardEyebrow
+        tone="ai"
+        seq={group.root.anchor_sequence_id}
+        onJump={onJump}
+        grip={<CardGrip {...gripProps} />}
+        right={
+          <>
+            {group.replies.length > 0 && (
+              <span className="note-thread-count" title={`${group.replies.length} follow-ups`}>
+                +{group.replies.length}
+              </span>
+            )}
+            <ModelTag name={rootModel} />
+          </>
+        }
+      />
+      {body}
     </article>
   );
 }

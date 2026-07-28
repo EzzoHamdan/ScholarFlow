@@ -39,19 +39,30 @@ interface Props {
   blockTinted: boolean;
   /** True when this block is the anchor of the note the reader is focused on. */
   active: boolean;
-  /** True when this block is the saved reading-progress bookmark. */
-  isBookmarked: boolean;
+  /** Set when this block carries one of the reader's bookmarks. */
+  bookmarkTitle: string | null;
   /**
    * Open the composer on a block that cannot be reached by highlighting.
    * Figures are images, and a KaTeX equation is a tree of spans that drag-
    * selects into gibberish — both need an explicit affordance.
    */
   onAsk: (block: DocBlock, kind: 'figure' | 'equation') => void;
+  /** Clicking the ribbon lifts the bookmark off this block. */
+  onClearBookmark: (seq: number) => void;
   registerRef: (seq: number, el: HTMLElement | null) => void;
 }
 
-function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, registerRef }: Props) {
+function ArticleBlockImpl({
+  block,
+  blockTinted,
+  active,
+  bookmarkTitle,
+  onAsk,
+  onClearBookmark,
+  registerRef,
+}: Props) {
   const seq = block.sequence_order;
+  const isBookmarked = bookmarkTitle !== null;
   const common = {
     'data-seq': String(seq),
     'data-chunk-id': block.id,
@@ -65,11 +76,34 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
     ].filter(Boolean).join(' '),
   };
 
+  /**
+   * The bookmark's presence in the text itself.
+   *
+   * A tinted background alone is easy to miss when you return to a paper days
+   * later and are scrolling fast; a ribbon in the margin is a shape, and shapes
+   * survive peripheral vision. It doubles as the control that removes the mark,
+   * which is where you would reach for it anyway.
+   */
+  const ribbon = isBookmarked ? (
+    <button
+      type="button"
+      className="article-bookmark-flag"
+      onClick={() => onClearBookmark(seq)}
+      title={`${bookmarkTitle} — click to remove this bookmark`}
+      aria-label="Remove this bookmark"
+    >
+      <svg viewBox="0 0 12 16" width="12" height="16" aria-hidden="true">
+        <path d="M1 1h10v14l-5-4-5 4z" />
+      </svg>
+    </button>
+  ) : null;
+
   if (block.structural_type === 'heading') {
     const level = block.heading_path?.length ?? 1;
     const text = block.plain_text || block.content_markdown.replace(/^#+\s*/, '');
     return (
       <section {...common}>
+        {ribbon}
         <h2 className={`article-h article-h${Math.min(level, 3)}`}>{text}</h2>
       </section>
     );
@@ -78,6 +112,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
   if (block.structural_type === 'figure') {
     return (
       <figure {...common}>
+        {ribbon}
         <div className="article-figure">
           {block.image_url ? (
             <img src={block.image_url} alt={block.plain_text || 'figure'} loading="lazy" />
@@ -105,6 +140,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
     const wrapped = body.startsWith('$$') ? body : `$$\n${body}\n$$`;
     return (
       <section {...common}>
+        {ribbon}
         <div className="article-math">
           <Md>{wrapped}</Md>
           <button
@@ -125,6 +161,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
     if (json?.headers && json?.rows) {
       return (
         <section {...common}>
+          {ribbon}
           <div className="article-table">
             <table>
               <thead>
@@ -150,6 +187,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
     }
     return (
       <section {...common}>
+        {ribbon}
         <div className="article-table">
           <Md>{block.content_markdown}</Md>
         </div>
@@ -162,6 +200,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
     const fenced = body.includes('```') ? body : `\`\`\`\n${body}\n\`\`\``;
     return (
       <section {...common}>
+        {ribbon}
         <div className="article-code"><Md>{fenced}</Md></div>
       </section>
     );
@@ -170,6 +209,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
   if (block.structural_type === 'footnote') {
     return (
       <aside {...common}>
+        {ribbon}
         <div className="article-footnote">
           {block.plain_text || block.content_markdown}
         </div>
@@ -179,6 +219,7 @@ function ArticleBlockImpl({ block, blockTinted, active, isBookmarked, onAsk, reg
 
   return (
     <section {...common}>
+      {ribbon}
       <Md>{block.content_markdown || block.plain_text}</Md>
     </section>
   );

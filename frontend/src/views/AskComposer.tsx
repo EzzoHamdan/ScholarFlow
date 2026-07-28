@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { CardEyebrow } from './NoteChrome';
 import type { ModelCatalog } from '../api';
 
 /**
@@ -69,6 +70,7 @@ export function AskComposer({
 
   return (
     <article className="note-card is-composer">
+      <CardEyebrow tone="composer" seq={target.sequenceId} word="New question" />
       <div className={`note-quote ${target.quote && !isMedia ? '' : 'note-quote-figure'}`}>
         {label}
       </div>

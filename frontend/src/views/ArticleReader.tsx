@@ -8,28 +8,44 @@ import {
   PersonalNoteComposer,
   type PersonalComposerTarget,
 } from './PersonalNoteCard';
+import { DeckCard, type DeckFace } from './DeckCard';
+import { MarginaliaPanel, buildMarginaliaRows } from './MarginaliaPanel';
+import type { CardDrag, DragKind } from './NoteChrome';
 import {
   captureSelection,
   clearAnchors,
   paintAnchors,
 } from '../lib/highlight';
 import {
-  clearBookmark,
-  loadBookmark,
-  loadPersonalNotes,
-  saveBookmark,
-  savePersonalNotes,
+  bookmarkFromWire,
+  deckFromWire,
+  deckToWire,
+  makeDeck,
+  makeId,
+  noteFromWire,
+  reconcileDecks,
+  type DeckMember,
+  type DeckMemberKind,
+  type NoteDeck,
   type PersonalBookmark,
   type PersonalNote,
 } from '../lib/personalNotes';
+import { loadPersonalState } from '../lib/personalState';
+import { formatRelativeTime } from '../lib/time';
 import { createPacer } from '../lib/pacer';
 import {
   askNoteStream,
+  createBookmark as createBookmarkApi,
+  createPersonalNote as createPersonalNoteApi,
+  deleteBookmark as deleteBookmarkApi,
   deleteNote as deleteNoteApi,
+  deletePersonalNote as deletePersonalNoteApi,
   getFullDocument,
   listModels,
   listNotes,
   moveNote as moveNoteApi,
+  putDecks,
+  updatePersonalNote as updatePersonalNoteApi,
   type DocBlock,
   type FullDocument,
   type MarginSide,
@@ -69,23 +85,72 @@ function layoutFor(width: number): Layout {
   return 'inline';
 }
 
+function truncate(text: string, max: number): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max).trimEnd()}…` : clean;
+}
+
+/** A deck of one is not a deck: its survivor goes back to standing alone. */
+function pruneDecks(decks: NoteDeck[]): NoteDeck[] {
+  return decks
+    .filter((d) => d.members.length >= 2)
+    .map((d) => ({ ...d, top: Math.min(Math.max(d.top, 0), d.members.length - 1) }));
+}
+
 /**
- * Short, human-friendly "saved X ago" for the Resume chip. The threshold
- * ladder is loose because nobody needs "saved 47 seconds ago" — the chip is
- * small and the user wants to know whether to trust the bookmark.
+ * The whole drag-to-stack rule, as one pure transformation.
+ *
+ * Every combination — card onto card, card onto deck, deck onto card, deck
+ * onto deck — collapses to the same sentence: the thing that was already
+ * sitting still keeps its place, and the thing that was dragged joins it.
+ * Whatever the moving card belonged to before is left without it.
+ *
+ * Kept out of the component because it is what actually gets written: the
+ * result is PUT as the paper's complete arrangement, so it has to be correct
+ * on its own rather than as a sequence of state updates.
+ *
+ * Returns null when the drop no longer makes sense — the target vanished
+ * mid-drag — so the caller can leave the arrangement untouched.
  */
-function formatRelativeTime(updatedAt: number, now: number = Date.now()): string {
-  const ms = now - updatedAt;
-  if (ms < 0 || ms < 60_000) return 'just now';
-  const m = Math.floor(ms / 60_000);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d < 30) return `${d}d ago`;
-  const mo = Math.floor(d / 30);
-  if (mo < 12) return `${mo}mo ago`;
-  return `${Math.floor(mo / 12)}y ago`;
+function stackDecks(
+  decks: NoteDeck[],
+  src: { id: string; kind: DragKind },
+  target: { id: string; kind: DragKind },
+  targetSide: MarginSide,
+): NoteDeck[] | null {
+  let next = decks.map((d) => ({ ...d, members: [...d.members] }));
+
+  let moving: DeckMember[];
+  if (src.kind === 'deck') {
+    const i = next.findIndex((d) => d.id === src.id);
+    if (i === -1) return null;
+    moving = next[i].members;
+    next.splice(i, 1);
+  } else {
+    moving = [{ id: src.id, kind: src.kind as DeckMemberKind }];
+    next = next.map((d) => ({ ...d, members: d.members.filter((m) => m.id !== src.id) }));
+  }
+
+  // Dropped on a deck, or on a card that is already inside one.
+  const holder =
+    next.find((d) => d.id === target.id) ??
+    next.find((d) => d.members.some((m) => m.id === target.id));
+
+  if (holder) {
+    const have = new Set(holder.members.map((m) => m.id));
+    holder.members = [...holder.members, ...moving.filter((m) => !have.has(m.id))];
+  } else if (target.kind !== 'deck') {
+    next.push(
+      makeDeck(
+        [{ id: target.id, kind: target.kind as DeckMemberKind }, ...moving],
+        targetSide,
+      ),
+    );
+  } else {
+    return null;
+  }
+
+  return pruneDecks(next);
 }
 
 let clientIdSeq = 0;
@@ -100,19 +165,61 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
   const [doc, setDoc] = useState<FullDocument | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notes, setNotes] = useState<PaperNote[]>([]);
+  /**
+   * Whether the server's notes have arrived. Decks reference note ids, so
+   * reconciling them against an empty list before the fetch lands would throw
+   * away every deck the reader built.
+   */
+  const [notesLoaded, setNotesLoaded] = useState(false);
   const [pending, setPending] = useState<PendingNote[]>([]);
   const [composer, setComposer] = useState<ComposerTarget | null>(null);
   const [personalComposer, setPersonalComposer] = useState<PersonalComposerTarget | null>(null);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [tintedBlocks, setTintedBlocks] = useState<Set<number>>(new Set());
   const [progress, setProgress] = useState(0);
-  const [outlineOpen, setOutlineOpen] = useState(false);
+  const [panel, setPanel] = useState<'contents' | 'bookmarks' | 'notes' | null>(null);
   const [layout, setLayout] = useState<Layout>(() => layoutFor(window.innerWidth));
   const wideEnough = layout !== 'inline';
 
-  // User-owned state persisted in localStorage.
+  /**
+   * User-owned state, served by the backend.
+   *
+   * Cleared during render when the paper changes rather than in the load
+   * effect: an effect runs after the commit, so for one paint the new paper
+   * would be rendered with the previous paper's marks in its margin.
+   */
   const [personalNotes, setPersonalNotes] = useState<PersonalNote[]>([]);
-  const [bookmark, setBookmark] = useState<PersonalBookmark | null>(null);
+  const [bookmarks, setBookmarks] = useState<PersonalBookmark[]>([]);
+  const [decks, setDecks] = useState<NoteDeck[]>([]);
+  const [personalLoaded, setPersonalLoaded] = useState(false);
+  /**
+   * A transient line above the article: what the localStorage migration moved,
+   * or why a write did not land. Personal state is the reader's own work, so a
+   * failure to save it has to be visible rather than swallowed.
+   */
+  const [notice, setNotice] = useState<{ text: string; tone: 'info' | 'error' } | null>(null);
+  const [loadedPaper, setLoadedPaper] = useState(paperId);
+  if (loadedPaper !== paperId) {
+    setLoadedPaper(paperId);
+    setPersonalNotes([]);
+    setBookmarks([]);
+    setDecks([]);
+    setPersonalLoaded(false);
+    setNotice(null);
+    setNotesLoaded(false);
+  }
+
+  // Deck writes replace the whole arrangement, so the in-flight value is read
+  // from a ref rather than from state: two gestures in quick succession must
+  // build on each other, not both on the render that was current when the
+  // first one started.
+  const decksRef = useRef<NoteDeck[]>([]);
+  const deckWriteSeq = useRef(0);
+
+  /** The card being dragged and the card under the pointer, if any. */
+  const [dragging, setDragging] = useState<{ id: string; kind: DragKind } | null>(null);
+  const [dragHover, setDragHover] = useState<string | null>(null);
+  const draggingRef = useRef<{ id: string; kind: DragKind } | null>(null);
 
   // Model choice. Remembered across sessions so the reader does not re-pick it
   // on every question, but re-validated against the catalog on load — a model
@@ -160,7 +267,8 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
 
     listNotes(paperId)
       .then((n) => { if (alive) setNotes(n); })
-      .catch(() => { /* notes are additive — a failure must not block reading */ });
+      .catch(() => { /* notes are additive — a failure must not block reading */ })
+      .finally(() => { if (alive) setNotesLoaded(true); });
 
     return () => { alive = false; };
   }, [paperId]);
@@ -175,16 +283,80 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     return () => clearInterval(id);
   }, [doc, paperId]);
 
-  // Load personal notes and bookmark for this paper.
+  // Bookmarks, personal notes and decks arrive together — decks reference the
+  // other two, so a deck list fetched separately can describe a note that is
+  // no longer there.
   useEffect(() => {
-    setPersonalNotes(loadPersonalNotes(paperId));
-    setBookmark(loadBookmark(paperId));
+    let alive = true;
+    loadPersonalState(paperId)
+      .then((state) => {
+        if (!alive) return;
+        setBookmarks(state.bookmarks);
+        setPersonalNotes(state.notes);
+        setDecks(state.decks);
+        decksRef.current = state.decks;
+        if (state.migrated) {
+          const { notes, bookmarks, decks } = state.migrated;
+          const parts = [
+            notes && `${notes} note${notes === 1 ? '' : 's'}`,
+            bookmarks && `${bookmarks} bookmark${bookmarks === 1 ? '' : 's'}`,
+            decks && `${decks} deck${decks === 1 ? '' : 's'}`,
+          ].filter(Boolean);
+          setNotice({
+            tone: 'info',
+            text: `Moved ${parts.join(', ')} from this browser to the server — they now follow you to any device.`,
+          });
+        }
+      })
+      .catch(() =>
+        setNotice({
+          tone: 'error',
+          text: 'Could not load your bookmarks and notes. The paper still reads, but the margin is empty.',
+        }),
+      )
+      .finally(() => { if (alive) setPersonalLoaded(true); });
+    return () => { alive = false; };
   }, [paperId]);
 
-  // Persist personal notes whenever they change.
+  // The notice is an acknowledgement, not a status bar — it goes on its own.
   useEffect(() => {
-    savePersonalNotes(paperId, personalNotes);
-  }, [paperId, personalNotes]);
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), notice.tone === 'error' ? 9000 : 7000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  // Keep the ref in step with anything that sets decks from outside a write
+  // (the load above, and the reconcile pass below).
+  useEffect(() => { decksRef.current = decks; }, [decks]);
+
+  /**
+   * Push a new deck arrangement and adopt whatever the server made of it.
+   *
+   * Optimistic, because dragging a card onto another should land under your
+   * hand rather than after a round trip. The sequence guard drops a response
+   * that has already been superseded: a full-collection PUT that resolves out
+   * of order would otherwise reinstate an arrangement the reader has moved on
+   * from.
+   */
+  const commitDecks = useCallback(
+    async (next: NoteDeck[]) => {
+      const previous = decksRef.current;
+      const seq = ++deckWriteSeq.current;
+      setDecks(next);
+      decksRef.current = next;
+      try {
+        const saved = (await putDecks(paperId, next.map(deckToWire))).map(deckFromWire);
+        if (deckWriteSeq.current !== seq) return;
+        setDecks(saved);
+        decksRef.current = saved;
+      } catch {
+        if (deckWriteSeq.current !== seq) return;
+        setDecks(previous);
+        decksRef.current = previous;
+      }
+    },
+    [paperId],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -237,6 +409,153 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     );
   }, [notes]);
 
+  // ── Decks ───────────────────────────────────────────────────────────────
+  //
+  // A deck is a local arrangement over notes it does not own, so it is
+  // re-validated whenever the underlying notes change rather than kept in
+  // lockstep with them. Held until the server's notes land, or the first pass
+  // would discard every deck for referencing ids it cannot see yet.
+  useEffect(() => {
+    if (!notesLoaded || !personalLoaded) return;
+    const aiIds = new Set(groups.map((g) => g.root.id));
+    const personalIds = new Set(personalNotes.map((n) => n.id));
+    setDecks((prev) => {
+      const next = reconcileDecks(prev, aiIds, personalIds);
+      const same =
+        next.length === prev.length &&
+        next.every((d, i) => d.members.length === prev[i].members.length && d.id === prev[i].id);
+      return same ? prev : next;
+    });
+  }, [groups, personalNotes, notesLoaded, personalLoaded]);
+
+  const deckMemberIds = useMemo(
+    () => new Set(decks.flatMap((d) => d.members.map((m) => m.id))),
+    [decks],
+  );
+
+  const faceFor = useCallback(
+    (member: DeckMember): DeckFace | null => {
+      if (member.kind === 'ai') {
+        const g = groups.find((x) => x.root.id === member.id);
+        if (!g) return null;
+        return {
+          id: member.id,
+          kind: 'ai',
+          title: truncate(g.root.question, 70),
+          seq: g.root.anchor_sequence_id,
+        };
+      }
+      const n = personalNotes.find((x) => x.id === member.id);
+      if (!n) return null;
+      return {
+        id: member.id,
+        kind: 'personal',
+        title: truncate(n.body, 70),
+        seq: n.anchorSequenceId,
+      };
+    },
+    [groups, personalNotes],
+  );
+
+  const facesOf = useCallback(
+    (deck: NoteDeck): DeckFace[] =>
+      deck.members.map(faceFor).filter((f): f is DeckFace => f !== null),
+    [faceFor],
+  );
+
+  /** A deck parks at its earliest member, so it never drifts as you flip. */
+  const deckSeq = useCallback(
+    (deck: NoteDeck): number => {
+      const seqs = facesOf(deck).map((f) => f.seq);
+      return seqs.length ? Math.min(...seqs) : 0;
+    },
+    [facesOf],
+  );
+
+  const sideForCard = useCallback(
+    (id: string, kind: DragKind): MarginSide => {
+      if (kind === 'ai') return notes.find((n) => n.id === id)?.margin_side || 'right';
+      if (kind === 'personal') return personalNotes.find((n) => n.id === id)?.marginSide || 'right';
+      return decks.find((d) => d.id === id)?.marginSide || 'right';
+    },
+    [notes, personalNotes, decks],
+  );
+
+  /**
+   * Drop one card (or one deck) onto another and stack them.
+   *
+   * Every combination collapses to the same rule: the thing that was already
+   * sitting still keeps its place in the margin, and the thing that was
+   * dragged joins it. Anything the moving card belonged to before is left
+   * without it, and a deck that falls below two cards stops being a deck.
+   */
+  const stackOnto = useCallback(
+    (targetId: string, targetKind: DragKind) => {
+      const src = draggingRef.current;
+      if (!src || src.id === targetId) return;
+      const next = stackDecks(
+        decksRef.current,
+        src,
+        { id: targetId, kind: targetKind },
+        sideForCard(targetId, targetKind),
+      );
+      if (next) void commitDecks(next);
+    },
+    [sideForCard, commitDecks],
+  );
+
+  const patchDeck = useCallback(
+    (deckId: string, patch: Partial<NoteDeck>) => {
+      void commitDecks(
+        decksRef.current.map((d) => (d.id === deckId ? { ...d, ...patch } : d)),
+      );
+    },
+    [commitDecks],
+  );
+
+  const spreadDeck = useCallback(
+    (deckId: string) => {
+      void commitDecks(decksRef.current.filter((d) => d.id !== deckId));
+    },
+    [commitDecks],
+  );
+
+  const takeOutOfDeck = useCallback(
+    (deckId: string, memberId: string) => {
+      void commitDecks(
+        pruneDecks(
+          decksRef.current.map((d) =>
+            d.id === deckId
+              ? { ...d, members: d.members.filter((m) => m.id !== memberId) }
+              : d,
+          ),
+        ),
+      );
+    },
+    [commitDecks],
+  );
+
+  const dragFor = useCallback(
+    (id: string, kind: DragKind): CardDrag => ({
+      id,
+      kind,
+      activeId: dragging?.id ?? null,
+      hoverId: dragHover,
+      onStart: (dragId, dragKind) => {
+        draggingRef.current = { id: dragId, kind: dragKind };
+        setDragging({ id: dragId, kind: dragKind });
+      },
+      onHover: setDragHover,
+      onEnd: () => {
+        draggingRef.current = null;
+        setDragging(null);
+        setDragHover(null);
+      },
+      onDrop: stackOnto,
+    }),
+    [dragging, dragHover, stackOnto],
+  );
+
   // ── Paint the quote highlights inside the article ───────────────────────
   useEffect(() => {
     if (!doc) return;
@@ -245,11 +564,13 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         noteId: g.root.id,
         sequenceId: g.root.anchor_sequence_id,
         quote: g.root.anchor_quote,
+        tone: 'ai' as const,
       })),
       ...personalNotes.map((pn) => ({
         noteId: pn.id,
         sequenceId: pn.anchorSequenceId,
         quote: pn.quote,
+        tone: 'personal' as const,
       })),
     ];
     // The article has to be laid out before ranges can be found in it.
@@ -288,6 +609,7 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       right: [],
     };
     for (const g of groups) {
+      if (deckMemberIds.has(g.root.id)) continue;
       bySide[sideOf(g.root.margin_side)].push({
         key: g.root.id,
         seq: g.root.anchor_sequence_id,
@@ -309,10 +631,14 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       });
     }
     for (const pn of personalNotes) {
+      if (deckMemberIds.has(pn.id)) continue;
       bySide[sideOf(pn.marginSide)].push({
         key: pn.id,
         seq: pn.anchorSequenceId,
       });
+    }
+    for (const deck of decks) {
+      bySide[sideOf(deck.marginSide)].push({ key: `deck:${deck.id}`, seq: deckSeq(deck) });
     }
 
     for (const side of ['left', 'right'] as MarginSide[]) {
@@ -328,7 +654,18 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         cursor = top + el.offsetHeight + NOTE_GAP;
       }
     }
-  }, [groups, pending, composer, personalComposer, personalNotes, wideEnough, sideOf]);
+  }, [
+    groups,
+    pending,
+    composer,
+    personalComposer,
+    personalNotes,
+    decks,
+    deckMemberIds,
+    deckSeq,
+    wideEnough,
+    sideOf,
+  ]);
 
   /**
    * Coalesced re-layout.
@@ -359,8 +696,9 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     };
   });
 
-  // Cards grow as answers stream in, and the article reflows as KaTeX and
-  // images settle. Re-measure on both rather than guessing at heights.
+  // Cards grow as answers stream in, cards collapse and expand under the
+  // reader's hand, and the article reflows as KaTeX and images settle.
+  // Re-measure on all of it rather than guessing at heights.
   useEffect(() => {
     if (!wideEnough) return;
     const ro = new ResizeObserver(requestLayout);
@@ -371,31 +709,74 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       ro.disconnect();
       window.removeEventListener('resize', requestLayout);
     };
-  }, [requestLayout, wideEnough, groups.length, pending.length, composer, personalNotes.length, personalComposer]);
+  }, [
+    requestLayout,
+    wideEnough,
+    groups.length,
+    pending.length,
+    composer,
+    personalNotes.length,
+    personalComposer,
+    decks,
+  ]);
 
-  // ── Reading progress ────────────────────────────────────────────────────
-  //
-  // We also recompute which block is currently the topmost in the viewport on
-  // every scroll — needed for the Resume chip to know whether it should appear
-  // as a navigation target or as a "you are here" indicator.
-  const [atBookmark, setAtBookmark] = useState(false);
-  const recomputeAtBookmark = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el || !doc) return;
-    const viewportTop = el.getBoundingClientRect().top + 8; // tolerate tiny offsets
-    let bestSeq = doc.blocks[0]?.sequence_order ?? 0;
-    let bestDelta = Infinity;
-    for (const block of doc.blocks) {
-      const bel = blockRefs.current.get(block.sequence_order);
-      if (!bel) continue;
-      const delta = Math.abs(bel.getBoundingClientRect().top - viewportTop);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        bestSeq = block.sequence_order;
+  // ── Where am I? ─────────────────────────────────────────────────────────
+  /**
+   * The block nearest the top of the viewport.
+   *
+   * ⚠ Binary search, not a scan. This runs on every scroll frame to keep the
+   * Resume chip and the panel's "you are here" marker honest, and the previous
+   * linear version read a bounding rect for every block in the paper — several
+   * hundred forced reflows per frame on a long document. Blocks are laid out
+   * top to bottom in sequence order, so their tops are monotonic and a search
+   * costs about ten reads instead.
+   */
+  const topmostBlock = useCallback(
+    (offset = 8): { seq: number; block: DocBlock } | null => {
+      const scroller = scrollRef.current;
+      const blocks = doc?.blocks;
+      if (!scroller || !blocks?.length) return null;
+      const targetY = scroller.getBoundingClientRect().top + offset;
+
+      const topAt = (i: number): number | null => {
+        // Probe outward if a block has no element yet, so one gap cannot
+        // derail the search.
+        for (let d = 0; d <= 4; d++) {
+          for (const j of [i + d, i - d]) {
+            if (j < 0 || j >= blocks.length) continue;
+            const el = blockRefs.current.get(blocks[j].sequence_order);
+            if (el) return el.getBoundingClientRect().top;
+          }
+        }
+        return null;
+      };
+
+      let lo = 0;
+      let hi = blocks.length - 1;
+      let best = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const top = topAt(mid);
+        if (top === null) break;
+        if (top <= targetY) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
       }
-    }
-    setAtBookmark(bestSeq === bookmark?.sequenceId);
-  }, [doc, bookmark?.sequenceId]);
+
+      // The closest block is either the last one above the line or the first
+      // one below it.
+      const nextTop = best + 1 < blocks.length ? topAt(best + 1) : null;
+      const bestTop = topAt(best);
+      const i =
+        nextTop !== null && bestTop !== null &&
+        Math.abs(nextTop - targetY) < Math.abs(bestTop - targetY)
+          ? best + 1
+          : best;
+      return { seq: blocks[i].sequence_order, block: blocks[i] };
+    },
+    [doc],
+  );
+
+  const [currentSeq, setCurrentSeq] = useState<number | null>(null);
+  const scrollFrame = useRef(0);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -403,14 +784,26 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     const max = el.scrollHeight - el.clientHeight;
     setProgress(max > 0 ? Math.min(1, el.scrollTop / max) : 0);
     setPill(null);
-    recomputeAtBookmark();
-  }, [recomputeAtBookmark]);
+    if (scrollFrame.current) return;
+    scrollFrame.current = requestAnimationFrame(() => {
+      scrollFrame.current = 0;
+      setCurrentSeq(topmostBlock()?.seq ?? null);
+    });
+  }, [topmostBlock]);
 
-  // ── Bookmark ────────────────────────────────────────────────────────────
-  // Build the human-readable preview shown on the Resume chip. A figure has no
-  // prose, an equation has math, etc. — so the snippet is a label rather than
-  // text in those cases. We also include a leading "¶N · " when there is no
-  // natural label so the chip always shows what the bookmark points at.
+  useEffect(() => () => {
+    if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
+  }, []);
+
+  // After the doc paints, block tops are finally measurable.
+  useLayoutEffect(() => {
+    setCurrentSeq(topmostBlock()?.seq ?? null);
+  }, [doc, topmostBlock]);
+
+  // ── Bookmarks ───────────────────────────────────────────────────────────
+  // Build the human-readable preview shown in the panel and the Resume chip. A
+  // figure has no prose and an equation has math, so the snippet is a label
+  // rather than text in those cases.
   const snippetForBlock = (block: DocBlock, seq: number): string => {
     const ref = `¶${seq}`;
     const t = block.structural_type;
@@ -418,7 +811,7 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     if (t === 'math') return `${ref} · equation`;
     const text = (block.plain_text || block.content_markdown || '').replace(/\s+/g, ' ').trim();
     if (!text) return ref;
-    return `${ref} · “${text.length > 60 ? text.slice(0, 60).trimEnd() + '…' : text}”`;
+    return `${ref} · “${truncate(text, 60)}”`;
   };
 
   const kindForBlock = (block: DocBlock): PersonalBookmark['kind'] => {
@@ -429,55 +822,90 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     return 'block';
   };
 
-  const saveBookmarkNow = useCallback(() => {
-    if (!doc || !scrollRef.current) return;
-    const scroller = scrollRef.current;
-    const viewportTop = scroller.getBoundingClientRect().top;
-    // Anchor to the block whose top is closest to the top of the viewport.
-    let bestSeq = doc.blocks[0]?.sequence_order ?? 0;
-    let bestBlock: DocBlock | null = doc.blocks[0] ?? null;
-    let bestDelta = Infinity;
-    for (const block of doc.blocks) {
-      const el = blockRefs.current.get(block.sequence_order);
-      if (!el) continue;
-      const delta = Math.abs(el.getBoundingClientRect().top - viewportTop);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        bestSeq = block.sequence_order;
-        bestBlock = block;
-      }
-    }
-    const b: PersonalBookmark = {
-      sequenceId: bestSeq,
-      progress,
-      updatedAt: Date.now(),
-      snippet: bestBlock ? snippetForBlock(bestBlock, bestSeq) : `¶${bestSeq}`,
-      kind: bestBlock ? kindForBlock(bestBlock) : 'block',
-      page: bestBlock?.page_start ?? null,
-    };
-    saveBookmark(paperId, b);
-    setBookmark(b);
-  }, [doc, paperId, progress]);
+  /**
+   * Add a bookmark at `seq`, or lift the one already there.
+   *
+   * Bookmarking the same block twice is always a mistake, so the second press
+   * is read as "actually, not here" rather than silently doing nothing.
+   */
+  /**
+   * Optimistic on both paths. Bookmarking is a reflex — it happens on a
+   * keypress mid-scroll — so the ribbon has to appear under the cursor rather
+   * than a round trip later. The temporary id is swapped for the real one
+   * when the row comes back, and a failure simply takes the mark away again.
+   */
+  const removeBookmark = useCallback(
+    (id: string) => {
+      const previous = bookmarks;
+      setBookmarks((prev) => prev.filter((b) => b.id !== id));
+      // A mark that was never saved has nothing to delete server-side.
+      if (id.startsWith('local-')) return;
+      void deleteBookmarkApi(paperId, id).catch(() => setBookmarks(previous));
+    },
+    [bookmarks, paperId],
+  );
 
-  const removeBookmark = useCallback(() => {
-    clearBookmark(paperId);
-    setBookmark(null);
-  }, [paperId]);
+  const toggleBookmarkAt = useCallback(
+    (seq: number) => {
+      const existing = bookmarks.find((b) => b.sequenceId === seq);
+      if (existing) {
+        removeBookmark(existing.id);
+        return;
+      }
+
+      const block = doc?.blocks.find((b) => b.sequence_order === seq) ?? null;
+      const draft: PersonalBookmark = {
+        id: `local-${makeId()}`,
+        sequenceId: seq,
+        progress,
+        updatedAt: Date.now(),
+        snippet: block ? snippetForBlock(block, seq) : `¶${seq}`,
+        kind: block ? kindForBlock(block) : 'block',
+        page: block?.page_start ?? null,
+        label: null,
+      };
+      setBookmarks((prev) => [...prev, draft]);
+
+      void createBookmarkApi(paperId, {
+        sequence_id: seq,
+        snippet: draft.snippet ?? null,
+        kind: draft.kind ?? 'block',
+        page: draft.page ?? null,
+        progress: draft.progress,
+      })
+        .then((wire) => {
+          const saved = bookmarkFromWire(wire);
+          setBookmarks((prev) => prev.map((b) => (b.id === draft.id ? saved : b)));
+        })
+        .catch(() => {
+          setBookmarks((prev) => prev.filter((b) => b.id !== draft.id));
+        });
+    },
+    [bookmarks, doc, paperId, progress, removeBookmark],
+  );
+
+  const bookmarkHere = useCallback(() => {
+    const at = topmostBlock();
+    if (at) toggleBookmarkAt(at.seq);
+  }, [topmostBlock, toggleBookmarkAt]);
+
+  const bookmarkedSeqs = useMemo(
+    () => new Map(bookmarks.map((b) => [b.sequenceId, b.label || b.snippet || `¶${b.sequenceId}`])),
+    [bookmarks],
+  );
+  /** "Resume" means the newest mark when there are several. */
+  const resume = useMemo(
+    () =>
+      bookmarks.length
+        ? bookmarks.reduce((a, b) => (b.updatedAt > a.updatedAt ? b : a))
+        : null,
+    [bookmarks],
+  );
+  const atResume = resume != null && currentSeq === resume.sequenceId;
 
   // jumpTo is declared later in this component, so bookmark navigation reads
   // it through a ref that is updated once jumpTo exists.
   const jumpToRef = useRef<(seq: number) => void>(() => {});
-
-  const jumpToBookmark = useCallback(() => {
-    if (!bookmark) return;
-    jumpToRef.current(bookmark.sequenceId);
-  }, [bookmark]);
-
-  // After the doc paints, the block tops are finally measurable. Re-evaluate
-  // "are we at the bookmark" once layout is in.
-  useLayoutEffect(() => {
-    recomputeAtBookmark();
-  }, [doc, bookmark, recomputeAtBookmark]);
 
   // ── Selection → the "Ask" pill ──────────────────────────────────────────
   useEffect(() => {
@@ -555,25 +983,15 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     window.getSelection()?.removeAllRanges();
   }, [suggestSide]);
 
-  const saveBookmarkFromSelection = useCallback(() => {
+  const bookmarkFromSelection = useCallback(() => {
     const article = articleRef.current;
     if (!article) return;
     const cap = captureSelection(article);
     setPill(null);
     if (!cap) return;
-    const block = doc?.blocks.find((b) => b.sequence_order === cap.sequenceId) ?? null;
-    const b: PersonalBookmark = {
-      sequenceId: cap.sequenceId,
-      progress,
-      updatedAt: Date.now(),
-      snippet: block ? snippetForBlock(block, cap.sequenceId) : `¶${cap.sequenceId}`,
-      kind: block ? kindForBlock(block) : 'block',
-      page: block?.page_start ?? null,
-    };
-    saveBookmark(paperId, b);
-    setBookmark(b);
+    toggleBookmarkAt(cap.sequenceId);
     window.getSelection()?.removeAllRanges();
-  }, [doc, paperId, progress]);
+  }, [toggleBookmarkAt]);
 
   const openComposerForBlock = useCallback(
     (block: DocBlock, kind: 'figure' | 'equation') => {
@@ -595,52 +1013,30 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
 
   /** Anchor to whatever block is nearest the top of the viewport. */
   const openComposerAtViewport = useCallback(() => {
-    const scroller = scrollRef.current;
-    if (!scroller || !doc) return;
-    const top = scroller.getBoundingClientRect().top + 80;
-    let best: { seq: number; id: string; delta: number } | null = null;
-    for (const block of doc.blocks) {
-      const el = blockRefs.current.get(block.sequence_order);
-      if (!el) continue;
-      const delta = Math.abs(el.getBoundingClientRect().top - top);
-      if (!best || delta < best.delta) {
-        best = { seq: block.sequence_order, id: block.id, delta };
-      }
-    }
-    if (!best) return;
+    const at = topmostBlock(80);
+    if (!at) return;
     setComposer({
-      sequenceId: best.seq,
-      chunkId: best.id,
+      sequenceId: at.seq,
+      chunkId: at.block.id,
       kind: 'block',
       quote: null,
       imageUrl: null,
-      marginSide: suggestSide(best.seq),
+      marginSide: suggestSide(at.seq),
     });
-  }, [doc, suggestSide]);
+  }, [topmostBlock, suggestSide]);
 
   const openPersonalComposerAtViewport = useCallback(() => {
-    const scroller = scrollRef.current;
-    if (!scroller || !doc) return;
-    const top = scroller.getBoundingClientRect().top + 80;
-    let best: { seq: number; id: string; delta: number } | null = null;
-    for (const block of doc.blocks) {
-      const el = blockRefs.current.get(block.sequence_order);
-      if (!el) continue;
-      const delta = Math.abs(el.getBoundingClientRect().top - top);
-      if (!best || delta < best.delta) {
-        best = { seq: block.sequence_order, id: block.id, delta };
-      }
-    }
-    if (!best) return;
+    const at = topmostBlock(80);
+    if (!at) return;
     setPersonalComposer({
-      sequenceId: best.seq,
-      chunkId: best.id,
+      sequenceId: at.seq,
+      chunkId: at.block.id,
       kind: 'block',
       quote: null,
       imageUrl: null,
-      marginSide: suggestSide(best.seq),
+      marginSide: suggestSide(at.seq),
     });
-  }, [doc, suggestSide]);
+  }, [topmostBlock, suggestSide]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -651,27 +1047,32 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
           target.tagName === 'INPUT' ||
           target.isContentEditable);
       if (typing) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-      if (e.key === 'a' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.key === 'a') {
         e.preventDefault();
         const cap = articleRef.current ? captureSelection(articleRef.current) : null;
         if (cap) openComposerFromSelection();
         else openComposerAtViewport();
       }
-      if (e.key === 'n' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.key === 'n') {
         e.preventDefault();
         const cap = articleRef.current ? captureSelection(articleRef.current) : null;
         if (cap) openPersonalComposerFromSelection();
         else openPersonalComposerAtViewport();
       }
-      if (e.key === 'b' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.key === 'b') {
         // Bookmark reuses the same "topmost block" rule as the bar's button.
         // Selection wins if there is one — a bookmark over a passage is a more
         // specific intent than "wherever I'm looking."
         e.preventDefault();
         const cap = articleRef.current ? captureSelection(articleRef.current) : null;
-        if (cap) saveBookmarkFromSelection();
-        else saveBookmarkNow();
+        if (cap) bookmarkFromSelection();
+        else bookmarkHere();
+      }
+      if (e.key === 'i') {
+        e.preventDefault();
+        setPanel((p) => (p ? null : 'contents'));
       }
       if (e.key === 'Escape') {
         setComposer(null);
@@ -686,8 +1087,8 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     openComposerAtViewport,
     openPersonalComposerFromSelection,
     openPersonalComposerAtViewport,
-    saveBookmarkFromSelection,
-    saveBookmarkNow,
+    bookmarkFromSelection,
+    bookmarkHere,
   ]);
 
   // ── Asking ──────────────────────────────────────────────────────────────
@@ -744,47 +1145,82 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     [paperId],
   );
 
+  /**
+   * Written to the server before it appears in the margin.
+   *
+   * The one non-optimistic mutation here: a new note has no id until the
+   * server gives it one, and a card rendered under a temporary id cannot be
+   * dragged into a deck — deck membership is a foreign key. Waiting is
+   * invisible against a local backend, and the composer stays open until the
+   * save lands, so a failure loses nothing the reader typed.
+   */
+  const savingNote = useRef(false);
   const submitPersonalNote = useCallback(
-    (body: string) => {
-      if (!personalComposer) return;
-      const now = Date.now();
-      const note: PersonalNote = {
-        id: `${now}-${Math.random().toString(36).slice(2, 10)}`,
-        anchorSequenceId: personalComposer.sequenceId,
-        anchorChunkId: personalComposer.chunkId,
-        quote: personalComposer.quote,
-        body,
-        marginSide: personalComposer.marginSide,
-        createdAt: now,
-        updatedAt: now,
-      };
-      setPersonalNotes((prev) => [...prev, note]);
-      setPersonalComposer(null);
+    async (body: string) => {
+      if (!personalComposer || savingNote.current) return;
+      const target = personalComposer;
+      savingNote.current = true;
+      try {
+        const saved = noteFromWire(
+          await createPersonalNoteApi(paperId, {
+            anchor_sequence_id: target.sequenceId,
+            body,
+            anchor_quote: target.quote,
+            margin_side: target.marginSide,
+          }),
+        );
+        setPersonalNotes((prev) => [...prev, saved]);
+        setPersonalComposer(null);
+      } catch {
+        // The composer stays open with the text still in it.
+        setNotice({
+          tone: 'error',
+          text: 'That note could not be saved. Your text is still in the composer.',
+        });
+      } finally {
+        savingNote.current = false;
+      }
     },
-    [personalComposer],
+    [personalComposer, paperId],
   );
 
-  const updatePersonalNote = useCallback((id: string, body: string) => {
-    setPersonalNotes((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, body, updatedAt: Date.now() } : n)),
-    );
-  }, []);
+  const updatePersonalNote = useCallback(
+    (id: string, body: string) => {
+      const previous = personalNotes;
+      setPersonalNotes((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, body, updatedAt: Date.now() } : n)),
+      );
+      void updatePersonalNoteApi(paperId, id, { body }).catch(() =>
+        setPersonalNotes(previous),
+      );
+    },
+    [personalNotes, paperId],
+  );
 
-  const removePersonalNote = useCallback((id: string) => {
-    setPersonalNotes((prev) => prev.filter((n) => n.id !== id));
-  }, []);
+  const removePersonalNote = useCallback(
+    (id: string) => {
+      const previous = personalNotes;
+      setPersonalNotes((prev) => prev.filter((n) => n.id !== id));
+      void deletePersonalNoteApi(paperId, id).catch(() => setPersonalNotes(previous));
+    },
+    [personalNotes, paperId],
+  );
 
   const flipPersonalNote = useCallback(
     (id: string) => {
+      const note = personalNotes.find((n) => n.id === id);
+      if (!note) return;
+      const next: MarginSide = note.marginSide === 'right' ? 'left' : 'right';
       setPersonalNotes((prev) =>
-        prev.map((n) =>
-          n.id === id
-            ? { ...n, marginSide: (n.marginSide === 'right' ? 'left' : 'right') as 'left' | 'right' }
-            : n,
-        ),
+        prev.map((n) => (n.id === id ? { ...n, marginSide: next } : n)),
       );
+      void updatePersonalNoteApi(paperId, id, { margin_side: next }).catch(() => {
+        setPersonalNotes((prev) =>
+          prev.map((n) => (n.id === id ? { ...n, marginSide: note.marginSide } : n)),
+        );
+      });
     },
-    [],
+    [personalNotes, paperId],
   );
 
   const submitComposer = useCallback(
@@ -895,6 +1331,10 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     jumpToRef.current = jumpTo;
   }, [jumpTo]);
 
+  const jumpToResume = useCallback(() => {
+    if (resume) jumpToRef.current(resume.sequenceId);
+  }, [resume]);
+
   // Clicking a [[42]] citation link inside a note scrolls the article.
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
@@ -912,34 +1352,81 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     else cardRefs.current.delete(key);
   }, []);
 
+  const clearBookmarkAt = useCallback((seq: number) => {
+    setBookmarks((prev) => prev.filter((b) => b.sequenceId !== seq));
+  }, []);
+
   // ── Render ──────────────────────────────────────────────────────────────
   const title = doc?.title || fallbackTitle;
-  const noteCount = groups.length;
 
   // Cards are rendered into whichever margin they belong to. Below the
   // two-gutter breakpoint sideOf() collapses everything to the right, so a
   // note saved on the left is still reachable on a narrow window.
   const canFlip = layout === 'both';
 
+  const marginaliaRows = useMemo(
+    () => buildMarginaliaRows(groups, personalNotes, decks),
+    [groups, personalNotes, decks],
+  );
+
+  /** Where each bookmark sits along the paper, 0..1, for the progress rail. */
+  const bookmarkTicks = useMemo(() => {
+    const blocks = doc?.blocks;
+    if (!blocks?.length) return [];
+    const index = new Map(blocks.map((b, i) => [b.sequence_order, i]));
+    const span = Math.max(blocks.length - 1, 1);
+    return bookmarks
+      .map((b) => {
+        const i = index.get(b.sequenceId);
+        return i == null ? null : { bookmark: b, at: i / span };
+      })
+      .filter((t): t is { bookmark: PersonalBookmark; at: number } => t !== null);
+  }, [bookmarks, doc]);
+
+  const renderAiCard = (group: NoteGroup, opts: { inDeck?: boolean; study?: { revealed: boolean; onReveal: () => void } | null } = {}) => (
+    <NoteCardView
+      group={group}
+      active={activeNoteId === group.root.id}
+      onFocus={() => setActiveNoteId(group.root.id)}
+      onJump={jumpTo}
+      onDelete={removeNote}
+      onFollowUp={submitFollowUp}
+      onFlip={canFlip && !opts.inDeck ? () => void flipNote(group.root.id) : null}
+      drag={opts.inDeck ? null : dragFor(group.root.id, 'ai')}
+      inDeck={opts.inDeck}
+      study={opts.study ?? null}
+    />
+  );
+
+  const renderPersonalCard = (
+    note: PersonalNote,
+    opts: { inDeck?: boolean; study?: { revealed: boolean; onReveal: () => void } | null } = {},
+  ) => (
+    <PersonalNoteCard
+      note={note}
+      active={activeNoteId === note.id}
+      onFocus={() => setActiveNoteId(note.id)}
+      onJump={jumpTo}
+      onDelete={removePersonalNote}
+      onEdit={updatePersonalNote}
+      onFlip={canFlip && !opts.inDeck ? () => flipPersonalNote(note.id) : null}
+      drag={opts.inDeck ? null : dragFor(note.id, 'personal')}
+      inDeck={opts.inDeck}
+      study={opts.study ?? null}
+    />
+  );
+
   const cardsFor = (side: MarginSide) => (
     <>
       {groups
-        .filter((g) => sideOf(g.root.margin_side) === side)
+        .filter((g) => !deckMemberIds.has(g.root.id) && sideOf(g.root.margin_side) === side)
         .map((group) => (
           <div
             key={group.root.id}
             className="note-slot"
             ref={(el) => registerCardRef(group.root.id, el)}
           >
-            <NoteCardView
-              group={group}
-              active={activeNoteId === group.root.id}
-              onFocus={() => setActiveNoteId(group.root.id)}
-              onJump={jumpTo}
-              onDelete={removeNote}
-              onFollowUp={submitFollowUp}
-              onFlip={canFlip ? () => void flipNote(group.root.id) : null}
-            />
+            {renderAiCard(group)}
           </div>
         ))}
 
@@ -953,6 +1440,7 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
           >
             <PendingNoteCard
               note={p}
+              onJump={jumpTo}
               onRetry={() => {
                 const retry = { ...p, error: null, answer: '', status: null };
                 void runNote(retry, {
@@ -994,20 +1482,53 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       )}
 
       {personalNotes
-        .filter((pn) => sideOf(pn.marginSide) === side)
+        .filter((pn) => !deckMemberIds.has(pn.id) && sideOf(pn.marginSide) === side)
         .map((pn) => (
           <div
             key={pn.id}
             className="note-slot"
             ref={(el) => registerCardRef(pn.id, el)}
           >
-            <PersonalNoteCard
-              note={pn}
-              active={false}
-              onFocus={() => {}}
-              onDelete={removePersonalNote}
-              onEdit={updatePersonalNote}
-              onFlip={canFlip ? () => flipPersonalNote(pn.id) : null}
+            {renderPersonalCard(pn)}
+          </div>
+        ))}
+
+      {decks
+        .filter((d) => sideOf(d.marginSide) === side)
+        .map((deck) => (
+          <div
+            key={deck.id}
+            className="note-slot"
+            ref={(el) => registerCardRef(`deck:${deck.id}`, el)}
+          >
+            <DeckCard
+              deck={deck}
+              faces={facesOf(deck)}
+              active={activeNoteId === deck.id}
+              onFocus={() => setActiveNoteId(deck.id)}
+              onJump={jumpTo}
+              onTopChange={(top) => patchDeck(deck.id, { top })}
+              onSpread={() => spreadDeck(deck.id)}
+              onTakeOut={(memberId) => takeOutOfDeck(deck.id, memberId)}
+              onToggleStudy={() => patchDeck(deck.id, { study: !deck.study })}
+              onRename={(label) => patchDeck(deck.id, { label })}
+              onFlip={
+                canFlip
+                  ? () =>
+                      patchDeck(deck.id, {
+                        marginSide: deck.marginSide === 'right' ? 'left' : 'right',
+                      })
+                  : null
+              }
+              drag={dragFor(deck.id, 'deck')}
+              renderFace={(face, study) => {
+                if (face.kind === 'ai') {
+                  const group = groups.find((g) => g.root.id === face.id);
+                  return group ? renderAiCard(group, { inDeck: true, study }) : null;
+                }
+                const note = personalNotes.find((n) => n.id === face.id);
+                return note ? renderPersonalCard(note, { inDeck: true, study }) : null;
+              }}
             />
           </div>
         ))}
@@ -1034,8 +1555,10 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
     </>
   );
 
+  const bookmarkedHere = currentSeq != null && bookmarkedSeqs.has(currentSeq);
+
   return (
-    <div className="reader-root">
+    <div className={`reader-root${dragging ? ' is-dragging-card' : ''}`}>
       <header className="reader-bar">
         <button onClick={onBack} className="reader-back">
           <IconBack className="w-3.5 h-3.5" />
@@ -1046,85 +1569,102 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
         <span className="reader-title">{title}</span>
 
         <div className="reader-bar-right">
-          {noteCount > 0 && (
-            <span className="reader-meta">{noteCount} note{noteCount === 1 ? '' : 's'}</span>
-          )}
-          {personalNotes.length > 0 && (
-            <span className="reader-meta">{personalNotes.length} personal {personalNotes.length === 1 ? 'note' : 'notes'}</span>
-          )}
           <button
-            className={`reader-chip${bookmark ? ' is-bookmark-update' : ''}`}
-            onClick={saveBookmarkNow}
+            className={`reader-chip is-mark${bookmarkedHere ? ' is-on' : ''}`}
+            onClick={bookmarkHere}
             title={
-              bookmark
-                ? `Update bookmark to where you are now (⌘B / B) · saved ${formatRelativeTime(bookmark.updatedAt)}`
-                : 'Bookmark where you are now (⌘B / B)'
+              bookmarkedHere
+                ? 'Remove the bookmark here (B)'
+                : 'Bookmark where you are — select text first to mark that passage (B)'
             }
           >
-            {bookmark ? 'Update bookmark' : 'Bookmark'}
+            <svg className="chip-glyph" viewBox="0 0 12 16" width="10" height="13" aria-hidden="true">
+              <path d="M1 1h10v14l-5-4-5 4z" />
+            </svg>
+            {bookmarkedHere ? 'Marked' : 'Bookmark'}
           </button>
-          {bookmark && (
+
+          {resume && (
             <button
-              className={`reader-chip is-bookmark${atBookmark ? ' is-bookmark-here' : ''}`}
-              onClick={atBookmark ? undefined : jumpToBookmark}
-              disabled={atBookmark}
+              className={`reader-chip is-resume${atResume ? ' is-here' : ''}`}
+              onClick={atResume ? undefined : jumpToResume}
+              disabled={atResume}
               title={
-                atBookmark
-                  ? `You're at your bookmark · ${bookmark.snippet ?? `¶${bookmark.sequenceId}`} · saved ${formatRelativeTime(bookmark.updatedAt)}`
-                  : `Resume at ${bookmark.snippet ?? `¶${bookmark.sequenceId}`} · saved ${formatRelativeTime(bookmark.updatedAt)}`
+                atResume
+                  ? `You're at your latest bookmark · saved ${formatRelativeTime(resume.updatedAt)}`
+                  : `Resume at ${resume.snippet ?? `¶${resume.sequenceId}`} · saved ${formatRelativeTime(resume.updatedAt)}`
               }
             >
-              {atBookmark ? (
-                <span className="reader-chip-line">
-                  <span className="reader-chip-glyph" aria-hidden="true">●</span>
+              {atResume ? (
+                <>
+                  <span className="chip-dot" aria-hidden="true" />
                   You're here
-                </span>
+                </>
               ) : (
-                <span className="reader-chip-line">
-                  <span className="reader-chip-glyph" aria-hidden="true">↧</span>
-                  <span className="reader-chip-text">{bookmark.snippet ?? `¶${bookmark.sequenceId}`}</span>
-                  <span className="reader-chip-when">{formatRelativeTime(bookmark.updatedAt)}</span>
-                </span>
+                <>
+                  <span className="chip-arrow" aria-hidden="true">↧</span>
+                  <span className="chip-text">
+                    {truncate(resume.label || resume.snippet || `¶${resume.sequenceId}`, 34)}
+                  </span>
+                  <span className="chip-when">{formatRelativeTime(resume.updatedAt)}</span>
+                </>
               )}
             </button>
           )}
-          {bookmark && (
-            <button
-              className="reader-chip is-bookmark-clear"
-              onClick={removeBookmark}
-              title="Clear bookmark"
-              aria-label="Clear bookmark"
-            >
-              ×
-            </button>
-          )}
-          {doc && doc.outline.length > 0 && (
-            <button
-              className="reader-chip"
-              onClick={() => setOutlineOpen((v) => !v)}
-            >
-              Contents
-            </button>
-          )}
+
+          <button
+            className={`reader-chip${panel ? ' is-on' : ''}`}
+            onClick={() => setPanel((p) => (p ? null : 'contents'))}
+            title="Contents, bookmarks and notes (I)"
+          >
+            Contents
+            {(bookmarks.length > 0 || marginaliaRows.length > 0) && (
+              <span className="chip-badge">{bookmarks.length + marginaliaRows.length}</span>
+            )}
+          </button>
+
           <span className="reader-meta">{Math.round(progress * 100)}%</span>
         </div>
-        <div className="reader-progress" style={{ width: `${progress * 100}%` }} />
+
+        {/* The rail doubles as a map: how far in you are, and where every mark
+            sits in the paper. Reaching a bookmark you forgot about is the
+            common failure of a single "resume" pointer. */}
+        <div className="reader-rail">
+          <div className="reader-progress" style={{ width: `${progress * 100}%` }} />
+          {bookmarkTicks.map(({ bookmark, at }) => (
+            <button
+              key={bookmark.id}
+              className="rail-tick"
+              style={{ left: `${at * 100}%` }}
+              onClick={() => jumpTo(bookmark.sequenceId)}
+              title={`${bookmark.label || bookmark.snippet || `¶${bookmark.sequenceId}`} · saved ${formatRelativeTime(bookmark.updatedAt)}`}
+              aria-label={`Jump to bookmark at paragraph ${bookmark.sequenceId}`}
+            />
+          ))}
+        </div>
       </header>
 
-      {outlineOpen && doc && (
-        <nav className="reader-outline" onClick={() => setOutlineOpen(false)}>
-          <div className="reader-outline-inner" onClick={(e) => e.stopPropagation()}>
-            {doc.outline.map((entry) => (
-              <button
-                key={entry.sequence_order}
-                className={`outline-item outline-l${Math.min(entry.level, 3)}`}
-                onClick={() => { jumpTo(entry.sequence_order); setOutlineOpen(false); }}
-              >
-                {entry.text}
-              </button>
-            ))}
-          </div>
-        </nav>
+      <MarginaliaPanel
+        open={panel !== null}
+        tab={panel ?? 'contents'}
+        onTabChange={setPanel}
+        onClose={() => setPanel(null)}
+        outline={doc?.outline ?? []}
+        bookmarks={bookmarks}
+        rows={marginaliaRows}
+        onJump={jumpTo}
+        onRemoveBookmark={removeBookmark}
+        onAddBookmark={bookmarkHere}
+        currentSeq={currentSeq}
+      />
+
+      {notice && (
+        <div className={`reader-toast${notice.tone === 'error' ? ' is-error' : ''}`}>
+          <span>{notice.text}</span>
+          <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
       )}
 
       <div className="reader-scroll thin-scroll" ref={scrollRef} onScroll={onScroll}>
@@ -1162,16 +1702,22 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
                 key={block.id}
                 block={block}
                 blockTinted={tintedBlocks.has(block.sequence_order)}
-                isBookmarked={bookmark?.sequenceId === block.sequence_order}
+                bookmarkTitle={bookmarkedSeqs.get(block.sequence_order) ?? null}
                 active={
                   activeNoteId != null &&
-                  groups.some(
+                  (groups.some(
                     (g) =>
                       g.root.id === activeNoteId &&
                       g.root.anchor_sequence_id === block.sequence_order,
-                  )
+                  ) ||
+                    personalNotes.some(
+                      (n) =>
+                        n.id === activeNoteId &&
+                        n.anchorSequenceId === block.sequence_order,
+                    ))
                 }
                 onAsk={openComposerForBlock}
+                onClearBookmark={clearBookmarkAt}
                 registerRef={registerBlockRef}
               />
             ))}
@@ -1195,7 +1741,7 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
             <button className="ask-pill is-note" onClick={openPersonalComposerFromSelection}>
               Note
             </button>
-            <button className="ask-pill is-bookmark" onClick={saveBookmarkFromSelection}>
+            <button className="ask-pill is-bookmark" onClick={bookmarkFromSelection}>
               Bookmark
             </button>
           </div>
@@ -1203,19 +1749,22 @@ export function ArticleReader({ paperId, fallbackTitle, onBack }: Props) {
       </div>
 
       {!composer && !personalComposer && (
-        <button className="ask-fab" onClick={openComposerAtViewport} title="Ask about what you're reading (A)">
-          Ask
-        </button>
-      )}
-
-      {!composer && !personalComposer && (
-        <button
-          className="ask-fab note-fab"
-          onClick={openPersonalComposerAtViewport}
-          title="Add your own note (N)"
-        >
-          Note
-        </button>
+        <div className="reader-fabs">
+          <button
+            className="ask-fab note-fab"
+            onClick={openPersonalComposerAtViewport}
+            title="Add your own note (N)"
+          >
+            Note
+          </button>
+          <button
+            className="ask-fab"
+            onClick={openComposerAtViewport}
+            title="Ask about what you're reading (A)"
+          >
+            Ask
+          </button>
+        </div>
       )}
     </div>
   );

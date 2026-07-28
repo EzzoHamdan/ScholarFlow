@@ -711,3 +711,165 @@ export function getRawPdfUrl(paperId: string): string {
 export function getStaticPdfUrl(paperId: string): string {
   return `/static/assets/${paperId}.pdf`;
 }
+
+// ── Personal reading state (bookmarks, own notes, decks) ──────────────────────
+//
+// Everything in the reader that belongs to the person rather than the paper.
+// Server-owned since it moved out of localStorage: marks made on the desktop
+// have to be there when the same paper is opened from the LAN server on
+// another device, and clearing site data must not destroy them.
+
+export interface WireBookmark {
+  id: string;
+  sequence_id: number;
+  snippet: string | null;
+  kind: 'text' | 'figure' | 'equation' | 'block';
+  page: number | null;
+  progress: number;
+  label: string | null;
+  updated_at: string | null;
+}
+
+export interface WirePersonalNote {
+  id: string;
+  anchor_sequence_id: number;
+  anchor_chunk_id: string | null;
+  anchor_quote: string | null;
+  body: string;
+  margin_side: MarginSide;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface WireDeckMember {
+  kind: 'ai' | 'personal';
+  id: string;
+}
+
+export interface WireDeck {
+  id: string;
+  label: string | null;
+  top: number;
+  margin_side: MarginSide;
+  study: boolean;
+  members: WireDeckMember[];
+}
+
+export interface WirePersonalState {
+  bookmarks: WireBookmark[];
+  notes: WirePersonalNote[];
+  decks: WireDeck[];
+}
+
+/**
+ * All three collections in one request.
+ *
+ * Decks reference the other two, so fetching them separately can produce a
+ * deck describing a note a concurrent delete already removed.
+ */
+export async function getPersonalState(paperId: string): Promise<WirePersonalState> {
+  const res = await fetch(`${BASE}/papers/${paperId}/personal`);
+  if (!res.ok) throw new Error(`Personal state fetch failed: ${res.status}`);
+  return res.json();
+}
+
+export interface BookmarkInput {
+  sequence_id: number;
+  snippet?: string | null;
+  kind?: string;
+  page?: number | null;
+  progress?: number;
+  label?: string | null;
+}
+
+export async function createBookmark(
+  paperId: string,
+  input: BookmarkInput,
+): Promise<WireBookmark> {
+  const res = await fetch(`${BASE}/papers/${paperId}/bookmarks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Bookmark save failed: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteBookmark(paperId: string, bookmarkId: string): Promise<void> {
+  const res = await fetch(`${BASE}/papers/${paperId}/bookmarks/${bookmarkId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`Bookmark delete failed: ${res.status}`);
+}
+
+export async function renameBookmark(
+  paperId: string,
+  bookmarkId: string,
+  label: string | null,
+): Promise<WireBookmark> {
+  const res = await fetch(`${BASE}/papers/${paperId}/bookmarks/${bookmarkId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label }),
+  });
+  if (!res.ok) throw new Error(`Bookmark rename failed: ${res.status}`);
+  return res.json();
+}
+
+export interface PersonalNoteInput {
+  anchor_sequence_id: number;
+  body: string;
+  anchor_quote?: string | null;
+  margin_side?: MarginSide;
+}
+
+export async function createPersonalNote(
+  paperId: string,
+  input: PersonalNoteInput,
+): Promise<WirePersonalNote> {
+  const res = await fetch(`${BASE}/papers/${paperId}/personal-notes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Note save failed: ${res.status}`);
+  return res.json();
+}
+
+export async function updatePersonalNote(
+  paperId: string,
+  noteId: string,
+  patch: { body?: string; margin_side?: MarginSide },
+): Promise<WirePersonalNote> {
+  const res = await fetch(`${BASE}/papers/${paperId}/personal-notes/${noteId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`Note update failed: ${res.status}`);
+  return res.json();
+}
+
+export async function deletePersonalNote(paperId: string, noteId: string): Promise<void> {
+  const res = await fetch(`${BASE}/papers/${paperId}/personal-notes/${noteId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`Note delete failed: ${res.status}`);
+}
+
+/**
+ * Replace the whole deck arrangement for a paper.
+ *
+ * One drag can dissolve a deck, create another, and move a card between two
+ * more. That is a single arrangement, so it travels as one request rather
+ * than an ordered sequence of calls with a half-applied state between each.
+ */
+export async function putDecks(paperId: string, decks: WireDeck[]): Promise<WireDeck[]> {
+  const res = await fetch(`${BASE}/papers/${paperId}/decks`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decks }),
+  });
+  if (!res.ok) throw new Error(`Deck save failed: ${res.status}`);
+  return (await res.json()).decks || [];
+}
